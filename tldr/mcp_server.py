@@ -8,7 +8,6 @@ Usage:
     tldr-mcp --project /path/to/project
 """
 
-import fcntl
 import hashlib
 import json
 import socket
@@ -16,7 +15,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import os
+import platform
+import tempfile
 from pathlib import Path
+
+# Conditional imports for file locking
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from mcp.server.fastmcp import FastMCP
 
@@ -64,9 +72,25 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
     # Acquire exclusive lock for startup coordination
     lock_path.touch(exist_ok=True)
-    with open(lock_path) as lock_file:
+    with open(lock_path, "w") as lock_file:
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if os.name == "nt":
+                # Windows locking logic
+                # Lock first 10 bytes (arbitrary small region)
+                # LK_RLCK blocks for 10s if locked, raising OSError if it fails
+                # We loop to simulate cleaner blocking behavior if needed, 
+                # but standard msvcrt.locking with LK_RLCK is the closest to LOCK_EX
+                # However, Python's msvcrt.locking doesn't wait indefinitely nicely.
+                # A simple busy wait loop with LK_NBLCK is often more robust.
+                while True:
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 10)
+                        break
+                    except OSError:
+                        time.sleep(0.1)
+            else:
+                # Unix locking
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
             # Re-check after acquiring lock (another process may have started daemon)
             if _ping_daemon(project):
@@ -93,7 +117,13 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
             raise RuntimeError(f"Failed to start TLDR daemon for {project}")
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            if os.name == "nt":
+                 try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 10)
+                 except OSError:
+                    pass
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _send_raw(project: str, command: dict) -> dict:
