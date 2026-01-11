@@ -14,6 +14,7 @@ P5 Features (Incremental Performance):
 - File change notifications trigger cache invalidation
 """
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -1197,9 +1198,30 @@ class TLDRDaemon:
             logger.info("Daemon stopped")
 
 
+def _get_lock_path(project: Path) -> Path:
+    """Get lock file path for daemon startup synchronization."""
+    hash_val = hashlib.md5(str(project).encode()).hexdigest()[:8]
+    return Path(f"/tmp/tldr-{hash_val}.lock")
+
+
+def _is_daemon_alive(project: Path) -> bool:
+    """Check if daemon is alive and responding to ping.
+
+    This is used during startup to avoid spawning duplicate daemons.
+    """
+    try:
+        result = query_daemon(project, {"cmd": "ping"})
+        return result.get("status") == "ok"
+    except Exception:
+        return False
+
+
 def start_daemon(project_path: str | Path, foreground: bool = False):
     """
     Start the TLDR daemon for a project.
+
+    Uses file locking to prevent race conditions when multiple processes
+    try to start the daemon simultaneously.
 
     Args:
         project_path: Path to the project root
@@ -1239,16 +1261,56 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
             print(f"Daemon started with PID {proc.pid}")
             print(f"Listening on {addr}:{port}")
         else:
-            # Unix: Fork and run in background
-            pid = os.fork()
-            if pid == 0:
-                # Child process
-                os.setsid()
-                daemon.run()
-            else:
-                # Parent process
-                print(f"Daemon started with PID {pid}")
-                print(f"Socket: {daemon.socket_path}")
+            # Unix: Fork and run in background with file locking
+            # This prevents race conditions when multiple agents start simultaneously
+            lock_path = _get_lock_path(project)
+            lock_path.touch(exist_ok=True)
+
+            with open(lock_path, 'r') as lock_file:
+                # Acquire exclusive lock - blocks until available
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+                try:
+                    # Re-check if daemon is running after acquiring lock
+                    # Another process may have started it while we were waiting
+                    if _is_daemon_alive(project):
+                        print("Daemon already running")
+                        return
+
+                    # Clean up stale socket if daemon is dead
+                    if daemon.socket_path.exists():
+                        daemon.socket_path.unlink()
+
+                    # Fork daemon process
+                    pid = os.fork()
+                    if pid == 0:
+                        # Child process - run daemon
+                        # NOTE: Don't release lock here! Parent holds it until daemon is ready.
+                        # The lock is shared between parent/child after fork, so parent
+                        # releasing it after daemon is confirmed ready is sufficient.
+                        os.setsid()
+                        daemon.run()
+                        sys.exit(0)  # Should not reach here
+                    else:
+                        # Parent process - wait for daemon to be ready before releasing lock
+                        start_time = time.time()
+                        timeout = 10.0
+                        while time.time() - start_time < timeout:
+                            if _is_daemon_alive(project):
+                                print(f"Daemon started with PID {pid}")
+                                print(f"Socket: {daemon.socket_path}")
+                                return
+                            time.sleep(0.1)
+
+                        # Daemon started but not responding - warn but don't fail
+                        print(f"Warning: Daemon started (PID {pid}) but not responding within {timeout}s")
+                        print(f"Socket: {daemon.socket_path}")
+                finally:
+                    # Release lock (parent only - child exits via daemon.run())
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass  # Lock may already be released by child
 
 
 def _create_client_socket(daemon: TLDRDaemon) -> socket.socket:
