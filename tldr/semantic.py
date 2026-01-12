@@ -249,7 +249,7 @@ def compute_embedding(text: str, model_name: Optional[str] = None):
     return np.array(embedding, dtype=np.float32)
 
 
-def extract_units_from_project(project_path: str, lang: str = "python", respect_ignore: bool = True) -> List[EmbeddingUnit]:
+def extract_units_from_project(project_path: str, lang: str = "python", respect_ignore: bool = True, progress_callback=None) -> List[EmbeddingUnit]:
     """Extract all functions/methods/classes from a project.
 
     Uses existing TLDR APIs:
@@ -272,8 +272,11 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
     project = Path(project_path).resolve()
     units = []
 
-    # Get code structure (L1)
-    structure = get_code_structure(str(project), language=lang)
+    # Load ignore spec before getting structure
+    ignore_spec = load_ignore_patterns(project) if respect_ignore else None
+
+    # Get code structure (L1) - use high limit for semantic index
+    structure = get_code_structure(str(project), language=lang, max_results=100000, ignore_spec=ignore_spec)
 
     # Filter ignored files
     if respect_ignore:
@@ -331,14 +334,14 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
                 for future in as_completed(futures):
                     file_info = futures[future]
                     try:
-                        file_units = future.result(timeout=60)  # 60s per file timeout
+                        file_units = future.result(timeout=60)
                         units.extend(file_units)
+                        if progress_callback:
+                            progress_callback(file_info.get('path', 'unknown'), len(units), len(files))
                     except Exception as e:
                         logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
-                        # Continue with other files
 
         except Exception as e:
-            # Fallback to sequential if parallel fails
             logger.warning(f"Parallel extraction failed: {e}, falling back to sequential")
             for file_info in files:
                 try:
@@ -346,16 +349,19 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
                         file_info, str(project), lang, calls_map, called_by_map
                     )
                     units.extend(file_units)
+                    if progress_callback:
+                        progress_callback(file_info.get('path', 'unknown'), len(units), len(files))
                 except Exception as fe:
                     logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {fe}")
     else:
-        # Sequential processing for single file or when parallel is disabled
         for file_info in files:
             try:
                 file_units = _process_file_for_extraction(
                     file_info, str(project), lang, calls_map, called_by_map
                 )
                 units.extend(file_units)
+                if progress_callback:
+                    progress_callback(file_info.get('path', 'unknown'), len(units), len(files))
             except Exception as e:
                 logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
 
@@ -779,7 +785,7 @@ def _get_progress_console():
 def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -> List[str]:
     """Scan project files to detect present languages."""
     from tldr.tldrignore import load_ignore_patterns, should_ignore
-    
+
     # Extension map (copied from cli.py to avoid circular import)
     EXTENSION_TO_LANGUAGE = {
         '.java': 'java',
@@ -809,21 +815,21 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
         '.ex': 'elixir',
         '.exs': 'elixir',
     }
-    
+
     found_languages = set()
     spec = load_ignore_patterns(project_path) if respect_ignore else None
-    
+
     for root, dirs, files in os.walk(project_path):
         # Prune common heavy dirs immediately for speed
         dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules', '.tldr', 'venv', '__pycache__', '.idea', '.vscode'}]
-        
+
         for file in files:
              file_path = Path(root) / file
-             
+
              # Check ignore patterns
              if respect_ignore and should_ignore(file_path, project_path, spec):
                  continue
-                 
+
              ext = file_path.suffix.lower()
              if ext in EXTENSION_TO_LANGUAGE:
                  found_languages.add(EXTENSION_TO_LANGUAGE[ext])
@@ -880,8 +886,11 @@ def build_semantic_index(
     # Extract all units (respecting .tldrignore)
     if console:
         with console.status("[bold green]Extracting code units...") as status:
+            def update_progress(file_path, units_count, total_files):
+                short_path = file_path if len(file_path) < 50 else "..." + file_path[-47:]
+                status.update(f"[bold green]Processing {short_path}... ({units_count} units)")
+
             if lang == "all":
-                # Optimization: detect which languages are actually present
                 status.update("[bold green]Scanning project languages...")
                 target_languages = _detect_project_languages(project, respect_ignore=respect_ignore)
                 if not target_languages:
@@ -889,13 +898,13 @@ def build_semantic_index(
                     return 0
                 if console:
                     console.print(f"[dim]Detected languages: {', '.join(target_languages)}[/dim]")
-                
+
                 units = []
                 for lang_name in target_languages:
                     status.update(f"[bold green]Extracting {lang_name} code units...")
-                    units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore))
+                    units.extend(extract_units_from_project(str(project), lang=lang_name, respect_ignore=respect_ignore, progress_callback=update_progress))
             else:
-                units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore)
+                units = extract_units_from_project(str(project), lang=lang, respect_ignore=respect_ignore, progress_callback=update_progress)
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
         if lang == "all":
@@ -911,8 +920,12 @@ def build_semantic_index(
     if not units:
         return 0
 
-    # Build embeddings with progress
-    embeddings = []
+    import numpy as np
+
+    BATCH_SIZE = 64
+    num_units = len(units)
+    texts = [build_embedding_text(unit) for unit in units]
+
     if console:
         from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
         with Progress(
@@ -922,31 +935,42 @@ def build_semantic_index(
             TaskProgressColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Computing embeddings...", total=len(units))
-            for unit in units:
-                text = build_embedding_text(unit)
-                embedding = compute_embedding(text, model_name=model)
-                embeddings.append(embedding)
-                progress.update(task, advance=1)
-    else:
-        for unit in units:
-            text = build_embedding_text(unit)
-            embedding = compute_embedding(text, model_name=model)
-            embeddings.append(embedding)
+            task = progress.add_task("Computing embeddings...", total=num_units)
 
-    # Stack into matrix
-    embeddings_matrix = np.vstack(embeddings).astype(np.float32)
+            model_obj = get_model(model)
+            all_embeddings = []
 
-    # Build FAISS index (inner product for normalized vectors = cosine similarity)
-    if console:
-        with console.status("[bold green]Building FAISS index..."):
-            dimension = embeddings_matrix.shape[1]
-            index = faiss.IndexFlatIP(dimension)
-            index.add(embeddings_matrix)
+            for i in range(0, num_units, BATCH_SIZE):
+                chunk_end = min(i + BATCH_SIZE, num_units)
+                chunk_texts = texts[i:chunk_end]
+
+                current_unit = units[i]
+                short_path = current_unit.file if len(current_unit.file) < 40 else "..." + current_unit.file[-37:]
+                progress.update(task, description=f"[bold green]Embedding {short_path}::{current_unit.name}")
+
+                result = model_obj.encode(
+                    chunk_texts,
+                    batch_size=BATCH_SIZE,
+                    normalize_embeddings=True,
+                    show_progress_bar=False
+                )
+                all_embeddings.extend(np.array(result, dtype=np.float32))
+
+                progress.update(task, completed=chunk_end)
+
+            embeddings_matrix = np.vstack(all_embeddings)
     else:
-        dimension = embeddings_matrix.shape[1]
-        index = faiss.IndexFlatIP(dimension)
-        index.add(embeddings_matrix)
+        model_obj = get_model(model)
+        result = model_obj.encode(
+            texts,
+            batch_size=BATCH_SIZE,
+            normalize_embeddings=True
+        )
+        embeddings_matrix = np.array(result, dtype=np.float32)
+
+    dimension = embeddings_matrix.shape[1]
+    index = faiss.IndexFlatIP(dimension)
+    index.add(embeddings_matrix)
 
     # Save index
     index_file = cache_dir / "index.faiss"

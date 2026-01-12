@@ -1466,23 +1466,33 @@ def _parse_php_use_node(node, source: bytes, imports: list):
                     if group_child.type == "namespace_use_clause":
                         clause_text = source[group_child.start_byte:group_child.end_byte].decode("utf-8").strip()
                         # Handle alias: User as UserModel
-                        name = clause_text.split(" as ")[0].strip()
+                        parts = clause_text.split(" as ")
+                        name = parts[0].strip()
+                        alias = parts[1].strip() if len(parts) > 1 else None
                         full_module = f"{prefix}\\{name}" if prefix else name
-                        imports.append({
+                        import_info = {
                             'module': full_module,
                             'type': 'use',
-                        })
+                        }
+                        if alias:
+                            import_info['alias'] = alias
+                        imports.append(import_info)
     else:
         # Simple imports: use App\Models\User;
         for child in node.children:
             if child.type == "namespace_use_clause":
                 clause_text = source[child.start_byte:child.end_byte].decode("utf-8").strip()
                 # Handle alias: User as UserModel
-                module = clause_text.split(" as ")[0].strip()
-                imports.append({
+                parts = clause_text.split(" as ")
+                module = parts[0].strip()
+                alias = parts[1].strip() if len(parts) > 1 else None
+                import_info = {
                     'module': module,
                     'type': 'use',
-                })
+                }
+                if alias:
+                    import_info['alias'] = alias
+                imports.append(import_info)
 
 
 def _parse_php_require_include_node(node, source: bytes) -> dict | None:
@@ -1759,6 +1769,8 @@ def build_function_index(
             _index_java_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "c":
             _index_c_file(src_path, rel_path, module_name, simple_module, index)
+        elif language == "php":
+            _index_php_file(src_path, rel_path, module_name, simple_module, index)
 
     return index
 
@@ -2126,6 +2138,112 @@ def _get_c_node_name(node, source: bytes) -> str | None:
                     for dc in pc.children:
                         if dc.type == "identifier":
                             return source[dc.start_byte:dc.end_byte].decode("utf-8")
+    return None
+
+
+def _index_php_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+    """Index functions, classes, and methods from a PHP file."""
+    if not TREE_SITTER_PHP_AVAILABLE:
+        return
+
+    try:
+        source = src_path.read_bytes()
+        parser = _get_php_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return
+
+    def add_to_index(name: str):
+        """Helper to add a name to the index."""
+        index[(module_name, name)] = str(rel_path)
+        index[(simple_module, name)] = str(rel_path)
+        index[f"{module_name}\\{name}"] = str(rel_path)
+        index[f"{simple_module}\\{name}"] = str(rel_path)
+
+    current_class = None
+    namespace = None
+
+    def walk_tree(node):
+        nonlocal current_class, namespace
+
+        # Namespace declaration
+        if node.type == "namespace_definition":
+            for child in node.children:
+                if child.type == "namespace_name":
+                    namespace = source[child.start_byte:child.end_byte].decode("utf-8")
+                    break
+            # Continue processing children
+            for child in node.children:
+                walk_tree(child)
+            return
+
+        # Class declarations
+        if node.type == "class_declaration":
+            class_name = _get_php_node_name(node, source)
+            if class_name:
+                add_to_index(class_name)
+                if namespace:
+                    # Also index with full namespace
+                    full_name = f"{namespace}\\{class_name}"
+                    index[(namespace, class_name)] = str(rel_path)
+                    index[full_name] = str(rel_path)
+                old_class = current_class
+                current_class = class_name
+                # Process class body
+                for child in node.children:
+                    walk_tree(child)
+                current_class = old_class
+                return  # Already processed children
+
+        # Interface declarations
+        elif node.type == "interface_declaration":
+            interface_name = _get_php_node_name(node, source)
+            if interface_name:
+                add_to_index(interface_name)
+
+        # Trait declarations
+        elif node.type == "trait_declaration":
+            trait_name = _get_php_node_name(node, source)
+            if trait_name:
+                add_to_index(trait_name)
+
+        # Method declarations
+        elif node.type == "method_declaration":
+            name = _get_php_node_name(node, source)
+            if name:
+                add_to_index(name)
+                # Also index as Class.method if we have a class context
+                if current_class:
+                    add_to_index(f"{current_class}::{name}")
+                    index[(current_class, name)] = str(rel_path)
+
+        # Function definitions (top-level)
+        elif node.type == "function_definition":
+            name = _get_php_node_name(node, source)
+            if name:
+                add_to_index(name)
+
+        for child in node.children:
+            walk_tree(child)
+
+    walk_tree(tree.root_node)
+
+
+def _get_php_node_name(node, source: bytes) -> str | None:
+    """Get the name identifier from a PHP AST node."""
+    for child in node.children:
+        if child.type == "name":
+            return source[child.start_byte:child.end_byte].decode("utf-8")
+    return None
+
+
+def _get_php_class_context(node, source: bytes) -> str | None:
+    """Get parent class name from PHP method declaration by walking up the tree."""
+    parent = node.parent
+    while parent:
+        if parent.type == "class_declaration":
+            return _get_php_node_name(parent, source)
+        parent = parent.parent
     return None
 
 
@@ -2833,6 +2951,144 @@ def _extract_c_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[s
     return calls_by_func
 
 
+def _extract_php_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+    """
+    Extract all function calls from a PHP file, grouped by caller function.
+
+    Returns:
+        Dict mapping caller function name to list of (call_type, call_target) tuples
+        call_type is 'direct', 'static', 'attr', or 'intra'
+    """
+    if not TREE_SITTER_PHP_AVAILABLE:
+        return {}
+
+    try:
+        source = file_path.read_bytes()
+        parser = _get_php_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return {}
+
+    calls_by_func = {}
+    defined_funcs = set()
+    defined_classes = set()
+
+    # Pass 1: Collect all defined function/class/method names
+    def collect_definitions(node):
+        if node.type == "function_definition":
+            name = _get_php_node_name(node, source)
+            if name:
+                defined_funcs.add(name)
+        elif node.type == "method_declaration":
+            name = _get_php_node_name(node, source)
+            if name:
+                defined_funcs.add(name)
+        elif node.type == "class_declaration":
+            name = _get_php_node_name(node, source)
+            if name:
+                defined_classes.add(name)
+        for child in node.children:
+            collect_definitions(child)
+
+    collect_definitions(tree.root_node)
+
+    # Pass 2: Extract calls from each function/method
+    def extract_calls_from_node(func_node, func_name: str):
+        calls = []
+
+        def visit_calls(node):
+            # Regular function call: foo()
+            if node.type == "function_call_expression":
+                # Get the function name or class::method being called
+                func_child = node.child_by_field_name("function")
+                if func_child:
+                    if func_child.type == "name":
+                        # Simple function call: foo()
+                        callee = source[func_child.start_byte:func_child.end_byte].decode("utf-8")
+                        if callee in defined_funcs:
+                            calls.append(('intra', callee))
+                        else:
+                            calls.append(('direct', callee))
+                    elif func_child.type == "scoped_call_expression":
+                        # Static method call: ClassName::method()
+                        scope = func_child.child_by_field_name("scope")
+                        name = func_child.child_by_field_name("name")
+                        if scope and name:
+                            class_name = source[scope.start_byte:scope.end_byte].decode("utf-8")
+                            method_name = source[name.start_byte:name.end_byte].decode("utf-8")
+                            if class_name in defined_classes:
+                                calls.append(('intra', f"{class_name}::{method_name}"))
+                            else:
+                                calls.append(('static', f"{class_name}::{method_name}"))
+                    elif func_child.type == "qualified_name":
+                        # Fully qualified call: \App\Service::method()
+                        callee = source[func_child.start_byte:func_child.end_byte].decode("utf-8")
+                        calls.append(('direct', callee))
+
+            # Member call expression: $obj->method()
+            elif node.type == "member_call_expression":
+                obj_node = node.child_by_field_name("object")
+                name_node = node.child_by_field_name("name")
+                if obj_node and name_node:
+                    obj_name = source[obj_node.start_byte:obj_node.end_byte].decode("utf-8")
+                    method_name = source[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                    # $this->method() is intra-file call to same class method
+                    if obj_name == "$this":
+                        if method_name in defined_funcs:
+                            calls.append(('intra', method_name))
+                        else:
+                            calls.append(('attr', f"$this->{method_name}"))
+                    else:
+                        calls.append(('attr', f"{obj_name}->{method_name}"))
+
+            for child in node.children:
+                visit_calls(child)
+
+        # Visit the function body
+        body_node = func_node.child_by_field_name("body")
+        if body_node:
+            visit_calls(body_node)
+
+        return calls
+
+    # Pass 3: Visit each function/method definition
+    current_class = None
+
+    def process_functions(node):
+        nonlocal current_class
+
+        if node.type == "class_declaration":
+            class_name = _get_php_node_name(node, source)
+            old_class = current_class
+            current_class = class_name
+            for child in node.children:
+                process_functions(child)
+            current_class = old_class
+            return
+
+        if node.type == "function_definition":
+            name = _get_php_node_name(node, source)
+            if name:
+                calls = extract_calls_from_node(node, name)
+                calls_by_func[name] = calls
+
+        elif node.type == "method_declaration":
+            name = _get_php_node_name(node, source)
+            if name:
+                calls = extract_calls_from_node(node, name)
+                calls_by_func[name] = calls
+                # Also store with class prefix if we have class context
+                if current_class:
+                    full_name = f"{current_class}::{name}"
+                    calls_by_func[full_name] = calls
+
+        for child in node.children:
+            process_functions(child)
+
+    process_functions(tree.root_node)
+    return calls_by_func
+
+
 def build_project_call_graph(
     root: str | Path,
     language: str = "python",
@@ -2879,6 +3135,8 @@ def build_project_call_graph(
         _build_java_call_graph(root, graph, func_index, workspace_config)
     elif language == "c":
         _build_c_call_graph(root, graph, func_index, workspace_config)
+    elif language == "php":
+        _build_php_call_graph(root, graph, func_index, workspace_config)
 
     return graph
 
@@ -3387,3 +3645,123 @@ def _build_c_call_graph(
                             if name == call_target:
                                 graph.add_edge(rel_path, caller_func, file_path, call_target)
                                 break
+
+
+def _build_php_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    func_index: dict,
+    workspace_config: Optional[WorkspaceConfig] = None
+):
+    """Build call graph for PHP files."""
+    for php_file in scan_project(root, "php", workspace_config):
+        php_path = Path(php_file)
+        rel_path = str(php_path.relative_to(root))
+
+        # Get imports for this file
+        imports = parse_php_imports(php_path)
+
+        # Build import resolution map
+        # For PHP: 'User' -> ('App\\Models', 'User')
+        import_map = {}  # alias -> (namespace, name)
+
+        for imp in imports:
+            if imp.get('type') == 'use':
+                module = imp.get('module', '')
+                # Parse full module path like "App\Models\User"
+                parts = module.split('\\')
+                if parts:
+                    name = parts[-1]  # Last part is the class/function name
+                    namespace = '\\'.join(parts[:-1]) if len(parts) > 1 else ''
+                    # Get alias if present
+                    alias = imp.get('alias', name)
+                    import_map[alias] = (namespace, name)
+                    import_map[name] = (namespace, name)
+
+        # Get calls from this file
+        calls_by_func = _extract_php_file_calls(php_path, root)
+
+        for caller_func, calls in calls_by_func.items():
+            for call_type, call_target in calls:
+                if call_type == 'intra':
+                    # Same file call
+                    graph.add_edge(rel_path, caller_func, rel_path, call_target)
+
+                elif call_type == 'direct':
+                    # Direct function call
+                    if call_target in import_map:
+                        namespace, orig_name = import_map[call_target]
+                        # Try to find in func_index
+                        # First try with simple module name
+                        simple_module = namespace.split('\\')[-1] if namespace else ''
+                        key = (simple_module, orig_name)
+                        if key in func_index:
+                            dst_file = func_index[key]
+                            graph.add_edge(rel_path, caller_func, dst_file, orig_name)
+                        else:
+                            # Try with full namespace
+                            key = (namespace, orig_name)
+                            if key in func_index:
+                                dst_file = func_index[key]
+                                graph.add_edge(rel_path, caller_func, dst_file, orig_name)
+                    else:
+                        # Try to find directly in func_index
+                        for key, file_path in func_index.items():
+                            if isinstance(key, tuple) and len(key) == 2:
+                                _, name = key
+                                if name == call_target:
+                                    graph.add_edge(rel_path, caller_func, file_path, call_target)
+                                    break
+
+                elif call_type == 'static':
+                    # ClassName::staticMethod()
+                    parts = call_target.split('::', 1)
+                    if len(parts) == 2:
+                        class_name, method = parts
+                        # Try to resolve class name via imports
+                        if class_name in import_map:
+                            namespace, resolved_class = import_map[class_name]
+                            # Look for Class::method in index
+                            for key, file_path in func_index.items():
+                                if isinstance(key, tuple) and len(key) == 2:
+                                    _, name = key
+                                    if name == method or name == f"{resolved_class}::{method}":
+                                        graph.add_edge(rel_path, caller_func, file_path, method)
+                                        break
+                        else:
+                            # Try direct lookup
+                            key = (class_name, method)
+                            if key in func_index:
+                                dst_file = func_index[key]
+                                graph.add_edge(rel_path, caller_func, dst_file, method)
+                            else:
+                                # Search in index
+                                for key, file_path in func_index.items():
+                                    if isinstance(key, tuple) and len(key) == 2:
+                                        _, name = key
+                                        if name == method:
+                                            graph.add_edge(rel_path, caller_func, file_path, method)
+                                            break
+
+                elif call_type == 'attr':
+                    # $obj->method() - try to find method in index
+                    parts = call_target.split('->', 1)
+                    if len(parts) == 2:
+                        obj, method = parts
+                        # For $this->method(), try to find method in same file first
+                        if obj == "$this":
+                            # Check if method exists in current file's functions
+                            for key, file_path in func_index.items():
+                                if isinstance(key, tuple) and len(key) == 2:
+                                    _, name = key
+                                    if name == method and file_path == rel_path:
+                                        graph.add_edge(rel_path, caller_func, rel_path, method)
+                                        break
+                        else:
+                            # Generic object method call - try to find method
+                            for key, file_path in func_index.items():
+                                if isinstance(key, tuple) and len(key) == 2:
+                                    _, name = key
+                                    if name == method:
+                                        graph.add_edge(rel_path, caller_func, file_path, method)
+                                        break

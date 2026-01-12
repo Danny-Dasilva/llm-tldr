@@ -351,7 +351,7 @@ Semantic Search:
     warm_p.add_argument(
         "--lang",
         default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "all"],
+        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "elixir", "all"],
         help="Language (use 'all' for multi-language)",
     )
 
@@ -367,7 +367,7 @@ Semantic Search:
     index_p.add_argument(
         "--lang",
         default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "all"],
+        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "elixir", "all"],
         help="Language (use 'all' for multi-language)",
     )
     index_p.add_argument(

@@ -1495,6 +1495,7 @@ def get_code_structure(
     root: str | Path,
     language: str = "python",
     max_results: int = 100,
+    ignore_spec=None,
 ) -> dict:
     """
     Get code structure (codemaps) for all files in a project.
@@ -1503,6 +1504,7 @@ def get_code_structure(
         root: Root directory to analyze
         language: Language to analyze ("python", "typescript", "go", "rust")
         max_results: Maximum number of files to analyze (default 100)
+        ignore_spec: Optional pathspec.PathSpec for gitignore-style patterns
 
     Returns:
         Dict with codemap structure:
@@ -1562,6 +1564,9 @@ def get_code_structure(
             if any(part.startswith(".") for part in rel_path.parts):
                 continue
         except ValueError:
+            continue
+
+        if ignore_spec and ignore_spec.match_file(rel_path):
             continue
 
         try:
