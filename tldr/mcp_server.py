@@ -44,11 +44,29 @@ def _get_lock_path(project: str) -> Path:
     return Path(tmp_dir) / f"tldr-{hash_val}.lock"
 
 
+def _get_connection_info(project: str) -> tuple[str, int | None]:
+    """Return (address, port) - port is None for Unix sockets.
+
+    On Windows, uses TCP on localhost with a deterministic port.
+    On Unix, uses Unix domain sockets.
+    """
+    if sys.platform == "win32":
+        hash_val = hashlib.md5(str(Path(project).resolve()).encode()).hexdigest()[:8]
+        port = 49152 + (int(hash_val, 16) % 10000)
+        return ("127.0.0.1", port)
+    else:
+        socket_path = _get_socket_path(project)
+        return (str(socket_path), None)
+
+
 def _ping_daemon(project: str) -> bool:
     """Check if daemon is alive and responding."""
-    socket_path = _get_socket_path(project)
-    if not socket_path.exists():
+    addr, port = _get_connection_info(project)
+    
+    # On Unix, check if socket file exists first
+    if port is None and not Path(addr).exists():
         return False
+    
     try:
         result = _send_raw(project, {"cmd": "ping"})
         return result.get("status") == "ok"
@@ -138,10 +156,18 @@ def _ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
 def _send_raw(project: str, command: dict) -> dict:
     """Send command to daemon socket."""
-    socket_path = _get_socket_path(project)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    addr, port = _get_connection_info(project)
+    
+    if port is not None:
+        # TCP socket for Windows
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((addr, port))
+    else:
+        # Unix socket for Linux/macOS
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(addr)
+    
     try:
-        sock.connect(str(socket_path))
         sock.sendall(json.dumps(command).encode() + b"\n")
 
         # Read response
