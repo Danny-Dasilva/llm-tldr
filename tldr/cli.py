@@ -826,6 +826,12 @@ Semantic Search:
             else:
                 # Build call graph
                 from .cross_file_calls import scan_project, ProjectCallGraph
+                from .tldrignore import ensure_tldrignore
+
+                # Ensure .tldrignore exists (create with defaults if not)
+                created, msg = ensure_tldrignore(project_path)
+                if created:
+                    print(msg)
 
                 respect_ignore = not getattr(args, 'no_ignore', False)
                 
