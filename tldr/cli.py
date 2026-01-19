@@ -11,6 +11,7 @@ Usage:
     tldr cfg <file> <function>          Control flow graph
     tldr dfg <file> <function>          Data flow graph
     tldr slice <file> <func> <line>     Program slice
+    tldr stats [path]                   Show token savings dashboard
 """
 import argparse
 import json
@@ -436,6 +437,27 @@ Semantic Search:
     )
     doctor_p.add_argument(
         "--json", action="store_true", help="Output as JSON"
+    )
+
+    # tldr stats [path] - Token savings dashboard
+    stats_p = subparsers.add_parser(
+        "stats", help="Show token savings statistics (raw files vs TLDR output)"
+    )
+    stats_p.add_argument("path", nargs="?", default=".", help="Directory to analyze")
+    stats_p.add_argument(
+        "--lang",
+        default="python",
+        choices=["python", "typescript", "javascript", "go", "rust"],
+        help="Language to analyze (default: python)",
+    )
+    stats_p.add_argument(
+        "--scenario",
+        choices=["all", "single", "context", "structure", "calls"],
+        default="all",
+        help="Which scenarios to benchmark (default: all)",
+    )
+    stats_p.add_argument(
+        "--json", action="store_true", help="Output as JSON instead of table"
     )
 
     args = parser.parse_args()
@@ -1212,6 +1234,188 @@ Semantic Search:
                 except (ConnectionRefusedError, FileNotFoundError):
                     # Daemon not running - silently ignore, file edits shouldn't fail
                     pass
+
+        elif args.command == "stats":
+            from .stats import count_tokens
+
+            project_path = Path(args.path).resolve()
+            lang = args.lang
+
+            # Collect files
+            respect_ignore = not getattr(args, 'no_ignore', False)
+            file_paths = scan_project_files(str(project_path), language=lang, respect_ignore=respect_ignore)
+            files = [Path(f) for f in file_paths]
+
+            if not files:
+                print(f"No {lang} files found in {project_path}", file=sys.stderr)
+                sys.exit(1)
+
+            results = []
+            scenarios_to_run = ["single", "context", "structure", "calls"] if args.scenario == "all" else [args.scenario]
+
+            # Scenario 1: Single file extract
+            if "single" in scenarios_to_run and files:
+                target_file = files[0]
+                raw_content = target_file.read_text(errors="ignore")
+                raw_tokens = count_tokens(raw_content)
+
+                tldr_output = extract_file(str(target_file))
+                tldr_text = json.dumps(tldr_output, indent=2) if isinstance(tldr_output, dict) else str(tldr_output)
+                tldr_tokens = count_tokens(tldr_text)
+
+                savings = (1 - tldr_tokens / raw_tokens) * 100 if raw_tokens > 0 else 0
+                results.append({
+                    "scenario": "Single file extract",
+                    "description": f"{target_file.name}",
+                    "raw_tokens": raw_tokens,
+                    "tldr_tokens": tldr_tokens,
+                    "savings_percent": round(savings, 1),
+                })
+
+            # Scenario 2: Context for entry point
+            if "context" in scenarios_to_run:
+                # Find a function to use as entry point
+                structure = get_code_structure(str(project_path), language=lang)
+                entry_func = None
+                entry_files = []
+
+                # Structure is {"root": ..., "languages": ..., "files": [...]}
+                files_list = structure.get("files", []) if isinstance(structure, dict) else structure
+                for file_info in files_list:
+                    if isinstance(file_info, dict) and "functions" in file_info:
+                        funcs = file_info.get("functions", [])
+                        for func in funcs:
+                            # Functions can be strings or dicts
+                            func_name = func.get("name") if isinstance(func, dict) else func
+                            if func_name and not func_name.startswith("_"):
+                                entry_func = func_name
+                                file_path = file_info.get("path", file_info.get("file", ""))
+                                if file_path:
+                                    entry_files.append(project_path / file_path)
+                                break
+                    if entry_func and len(entry_files) >= 3:
+                        break
+
+                if entry_func and entry_files:
+                    # Raw: read files that would be needed
+                    raw_content = ""
+                    for f in entry_files[:3]:
+                        if f.exists():
+                            raw_content += f.read_text(errors="ignore") + "\n"
+                    raw_tokens = count_tokens(raw_content)
+
+                    # TLDR context (project, entry_point, depth, language)
+                    tldr_result = get_relevant_context(str(project_path), entry_func, depth=2, language=lang)
+                    tldr_output = tldr_result.to_llm_string() if hasattr(tldr_result, 'to_llm_string') else str(tldr_result)
+                    tldr_tokens = count_tokens(tldr_output)
+
+                    savings = (1 - tldr_tokens / raw_tokens) * 100 if raw_tokens > 0 else 0
+                    results.append({
+                        "scenario": "Function context",
+                        "description": f"{entry_func}() depth=2",
+                        "raw_tokens": raw_tokens,
+                        "tldr_tokens": tldr_tokens,
+                        "savings_percent": round(savings, 1),
+                    })
+
+            # Scenario 3: Codebase structure
+            if "structure" in scenarios_to_run:
+                # Raw: concatenate all files
+                raw_content = ""
+                for f in files[:20]:  # Limit to 20 files for sanity
+                    raw_content += f.read_text(errors="ignore") + "\n"
+                raw_tokens = count_tokens(raw_content)
+
+                # TLDR structure
+                structure = get_code_structure(str(project_path), language=lang)
+                tldr_text = json.dumps(structure, indent=2)
+                tldr_tokens = count_tokens(tldr_text)
+
+                savings = (1 - tldr_tokens / raw_tokens) * 100 if raw_tokens > 0 else 0
+                results.append({
+                    "scenario": "Codebase structure",
+                    "description": f"{min(len(files), 20)} files codemap",
+                    "raw_tokens": raw_tokens,
+                    "tldr_tokens": tldr_tokens,
+                    "savings_percent": round(savings, 1),
+                })
+
+            # Scenario 4: Call graph
+            if "calls" in scenarios_to_run:
+                # Raw: all project files
+                raw_content = ""
+                for f in files:
+                    raw_content += f.read_text(errors="ignore") + "\n"
+                raw_tokens = count_tokens(raw_content)
+
+                # TLDR call graph
+                graph = build_project_call_graph(str(project_path), language=lang)
+                edges_list = list(graph.edges)
+                # Derive files and functions from edges
+                all_files = set()
+                all_funcs = set()
+                for e in edges_list:
+                    all_files.add(e[0])
+                    all_files.add(e[2])
+                    all_funcs.add(f"{e[0]}:{e[1]}")
+                    all_funcs.add(f"{e[2]}:{e[3]}")
+
+                graph_data = {
+                    "files": sorted(all_files),
+                    "functions": sorted(all_funcs),
+                    "edges": [{"from": f"{e[0]}:{e[1]}", "to": f"{e[2]}:{e[3]}"} for e in edges_list[:100]],
+                }
+                tldr_text = json.dumps(graph_data, indent=2)
+                tldr_tokens = count_tokens(tldr_text)
+
+                savings = (1 - tldr_tokens / raw_tokens) * 100 if raw_tokens > 0 else 0
+                results.append({
+                    "scenario": "Call graph",
+                    "description": f"{len(files)} files, {len(edges_list)} edges",
+                    "raw_tokens": raw_tokens,
+                    "tldr_tokens": tldr_tokens,
+                    "savings_percent": round(savings, 1),
+                })
+
+            # Output
+            if args.json:
+                print(json.dumps({"scenarios": results}, indent=2))
+            else:
+                # Calculate totals
+                total_raw = sum(r["raw_tokens"] for r in results)
+                total_tldr = sum(r["tldr_tokens"] for r in results)
+                total_savings = (1 - total_tldr / total_raw) * 100 if total_raw > 0 else 0
+
+                # Header
+                print(f"\n{'='*70}")
+                print(f"  TLDR Token Savings Dashboard - {project_path.name}")
+                print(f"{'='*70}")
+                print(f"  Language: {lang} | Files: {len(files)}")
+                print(f"{'='*70}\n")
+
+                # Table header
+                print(f"  {'Scenario':<25} {'Raw':>10} {'TLDR':>10} {'Savings':>10}")
+                print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+
+                # Rows
+                for r in results:
+                    print(f"  {r['scenario']:<25} {r['raw_tokens']:>10,} {r['tldr_tokens']:>10,} {r['savings_percent']:>9.1f}%")
+
+                # Total
+                print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+                print(f"  {'TOTAL':<25} {total_raw:>10,} {total_tldr:>10,} {total_savings:>9.1f}%")
+
+                # Cost estimates
+                print(f"\n  Cost Estimates (per query):")
+                print(f"  {'-'*50}")
+                # Claude pricing: Sonnet ~$3/M input, Opus ~$15/M input
+                sonnet_raw = total_raw * 3 / 1_000_000
+                sonnet_tldr = total_tldr * 3 / 1_000_000
+                opus_raw = total_raw * 15 / 1_000_000
+                opus_tldr = total_tldr * 15 / 1_000_000
+                print(f"  Claude Sonnet ($3/M):  Raw ${sonnet_raw:.4f}  →  TLDR ${sonnet_tldr:.4f}")
+                print(f"  Claude Opus ($15/M):   Raw ${opus_raw:.4f}  →  TLDR ${opus_tldr:.4f}")
+                print(f"\n{'='*70}\n")
 
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
