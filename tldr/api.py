@@ -27,6 +27,40 @@ from .ast_extractor import (
     extract_file as _extract_file_impl,
 )
 
+
+def _iter_files_with_ignore(root: Path, extensions: set[str] | None = None) -> list[Path]:
+    """Iterate files respecting .tldrignore patterns.
+
+    This function skips ignored directories during traversal for performance.
+    Critical for large projects with many ignored directories (node_modules, .venv, etc).
+    """
+    from tldr.tldrignore import load_ignore_patterns
+    import os
+
+    spec = load_ignore_patterns(root)
+    result = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+
+        # Prune ignored directories IN-PLACE (critical for os.walk performance)
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith('.') and not spec.match_file(os.path.join(rel_dir, d) + "/")
+        ]
+
+        for filename in filenames:
+            if filename.startswith('.'):
+                continue
+            rel_path = os.path.join(rel_dir, filename) if rel_dir != '.' else filename
+            if spec.match_file(rel_path):
+                continue
+            file_path = Path(dirpath) / filename
+            if extensions is None or file_path.suffix in extensions:
+                result.append(file_path)
+
+    return result
+
 # Re-export for public API
 __all__ = [
     # Dataclasses from ast_extractor
@@ -580,14 +614,8 @@ def get_relevant_context(
     # Also cache file sources for CFG extraction
     file_sources: dict[str, str] = {}
 
-    for file_path in project.rglob("*"):
-        # Check for hidden paths relative to project root, not absolute path
-        try:
-            rel_path = file_path.relative_to(project)
-            is_hidden = any(p.startswith('.') for p in rel_path.parts)
-        except ValueError:
-            is_hidden = False  # Not relative to project, allow it
-        if file_path.suffix in extensions and not is_hidden:
+    for file_path in _iter_files_with_ignore(project, extensions):
+        if True:  # Already filtered by _iter_files_with_ignore
             try:
                 source = file_path.read_text()
                 file_sources[str(file_path)] = source
@@ -1306,6 +1334,11 @@ def get_file_tree(
 
     root = Path(root)
 
+    # Load ignore patterns if not provided (performance critical for large projects)
+    if ignore_spec is None:
+        from tldr.tldrignore import load_ignore_patterns
+        ignore_spec = load_ignore_patterns(root)
+
     def scan_dir(path: Path) -> dict:
         result = {"name": path.name, "type": "dir", "children": []}
 
@@ -1399,36 +1432,12 @@ def search(
     compiled = re.compile(pattern)
     files_scanned = 0
 
-    for file_path in root.rglob("*"):
+    # Use _iter_files_with_ignore for efficient directory pruning
+    all_files = _iter_files_with_ignore(root, extensions)
+    for file_path in all_files:
         # Check file limit
         if max_files > 0 and files_scanned >= max_files:
             break
-
-        if not file_path.is_file():
-            continue
-
-        # Get relative path for filtering
-        try:
-            rel_path = file_path.relative_to(root)
-            rel_path_str = str(rel_path)
-            parts = rel_path.parts
-        except ValueError:
-            continue
-
-        # Use ignore_spec if provided, otherwise fall back to hardcoded SKIP_DIRS
-        if ignore_spec:
-            if ignore_spec.match_file(rel_path_str):
-                continue
-        else:
-            # Fallback: skip hidden files and junk directories
-            if any(part.startswith(".") for part in parts):
-                continue
-            if any(part in SKIP_DIRS for part in parts):
-                continue
-
-        # Filter by extension
-        if extensions and file_path.suffix not in extensions:
-            continue
 
         files_scanned += 1
 
@@ -1569,26 +1578,11 @@ def get_code_structure(
     result = {"root": str(root), "language": language, "files": []}
 
     count = 0
-    for file_path in root.rglob("*"):
+    # Use _iter_files_with_ignore for efficient directory pruning
+    all_files = _iter_files_with_ignore(root, extensions)
+    for file_path in all_files:
         if count >= max_results:
             break
-
-        if not file_path.is_file():
-            continue
-
-        if file_path.suffix not in extensions:
-            continue
-
-        # Skip hidden files (only check relative path, not parent directories)
-        try:
-            rel_path = file_path.relative_to(root)
-            if any(part.startswith(".") for part in rel_path.parts):
-                continue
-        except ValueError:
-            continue
-
-        if ignore_spec and ignore_spec.match_file(rel_path):
-            continue
 
         try:
             info = _extract_file_impl(str(file_path))
