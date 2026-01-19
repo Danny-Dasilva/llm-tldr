@@ -174,8 +174,12 @@ def _build_caller_tree(
     }
 
     for caller in callers:
-        subtree = _build_caller_tree(caller, reverse, depth - 1, visited.copy())
+        # Use backtracking instead of copying visited set - O(1) vs O(n)
+        subtree = _build_caller_tree(caller, reverse, depth - 1, visited)
         tree["callers"].append(subtree)
+
+    # Backtrack: allow this node to be visited via different paths
+    visited.discard(func)
 
     return tree
 

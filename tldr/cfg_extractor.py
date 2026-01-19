@@ -123,7 +123,7 @@ except ImportError:
     pass
 
 
-@dataclass
+@dataclass(slots=True)
 class CFGBlock:
     """
     Basic block - sequential statements with no internal branches.
@@ -166,7 +166,7 @@ class CFGBlock:
         return '\n'.join(lines[start_idx:end_idx])
 
 
-@dataclass
+@dataclass(slots=True)
 class CFGEdge:
     """
     Edge between blocks with optional branch condition.
@@ -1218,8 +1218,19 @@ class TreeSitterCFGBuilder:
         self.current_block = after_switch
 
 
+# Module-level parser cache for performance (parsers are expensive to create)
+_cfg_parser_cache: dict[str, object] = {}
+
+
 def _get_ts_parser(language: str):
-    """Get or create a tree-sitter parser for the given language."""
+    """Get or create a tree-sitter parser for the given language.
+
+    Parsers are cached to avoid expensive re-creation on each call.
+    """
+    # Check cache first
+    if language in _cfg_parser_cache:
+        return _cfg_parser_cache[language]
+
     from tree_sitter import Language, Parser
 
     parser = Parser()
@@ -1312,6 +1323,8 @@ def _get_ts_parser(language: str):
     else:
         raise ValueError(f"Unsupported language: {language}")
 
+    # Cache the parser for reuse
+    _cfg_parser_cache[language] = parser
     return parser
 
 

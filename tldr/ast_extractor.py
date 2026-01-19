@@ -192,6 +192,330 @@ class ModuleInfo:
         return result
 
 
+# Standalone helper functions for single-pass extraction
+# These are module-level to avoid method lookup overhead in hot paths
+
+def _node_to_str(node: ast.AST | None) -> str:
+    """Convert AST node to string representation."""
+    if node is None:
+        return ""
+    # Python 3.9+ has ast.unparse
+    try:
+        return ast.unparse(node)
+    except AttributeError:
+        # Fallback for older Python
+        return _manual_unparse(node)
+
+
+def _manual_unparse(node: ast.AST) -> str:
+    """Manual unparse for older Python versions."""
+    if isinstance(node, ast.Name):
+        return node.id
+    elif isinstance(node, ast.Attribute):
+        return f"{_manual_unparse(node.value)}.{node.attr}"
+    elif isinstance(node, ast.Subscript):
+        return f"{_manual_unparse(node.value)}[{_manual_unparse(node.slice)}]"
+    elif isinstance(node, ast.Constant):
+        return repr(node.value)
+    elif isinstance(node, ast.Tuple):
+        elts = ", ".join(_manual_unparse(e) for e in node.elts)
+        return f"({elts})"
+    elif isinstance(node, ast.List):
+        elts = ", ".join(_manual_unparse(e) for e in node.elts)
+        return f"[{elts}]"
+    elif isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.BitOr):
+            return f"{_manual_unparse(node.left)} | {_manual_unparse(node.right)}"
+    elif isinstance(node, ast.Call):
+        func = _manual_unparse(node.func)
+        args = ", ".join(_manual_unparse(a) for a in node.args)
+        return f"{func}({args})"
+    return "<unknown>"
+
+
+def _format_arg(arg: ast.arg) -> str:
+    """Format a single argument with optional type annotation."""
+    if arg.annotation:
+        return f"{arg.arg}: {_node_to_str(arg.annotation)}"
+    return arg.arg
+
+
+def _extract_params(args: ast.arguments) -> list[str]:
+    """Extract parameter list with type annotations."""
+    params = []
+
+    # Positional-only params (before /)
+    for arg in args.posonlyargs:
+        params.append(_format_arg(arg))
+
+    if args.posonlyargs:
+        params.append("/")
+
+    # Regular positional/keyword params
+    defaults_start = len(args.args) - len(args.defaults)
+    for i, arg in enumerate(args.args):
+        param = _format_arg(arg)
+        # Add default value indicator
+        if i >= defaults_start:
+            default_idx = i - defaults_start
+            default = args.defaults[default_idx]
+            param += f" = {_node_to_str(default)}"
+        params.append(param)
+
+    # *args
+    if args.vararg:
+        params.append(f"*{_format_arg(args.vararg)}")
+    elif args.kwonlyargs:
+        params.append("*")
+
+    # Keyword-only params
+    kw_defaults_map = {i: d for i, d in enumerate(args.kw_defaults) if d is not None}
+    for i, arg in enumerate(args.kwonlyargs):
+        param = _format_arg(arg)
+        if i in kw_defaults_map:
+            param += f" = {_node_to_str(kw_defaults_map[i])}"
+        params.append(param)
+
+    # **kwargs
+    if args.kwarg:
+        params.append(f"**{_format_arg(args.kwarg)}")
+
+    return params
+
+
+def _extract_function_info(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    is_method: bool = False
+) -> FunctionInfo:
+    """Extract function/method information."""
+    params = _extract_params(node.args)
+    return_type = _node_to_str(node.returns) if node.returns else None
+    decorators = [_node_to_str(d) for d in node.decorator_list]
+
+    return FunctionInfo(
+        name=node.name,
+        params=params,
+        return_type=return_type,
+        docstring=ast.get_docstring(node),
+        is_method=is_method,
+        is_async=isinstance(node, ast.AsyncFunctionDef),
+        decorators=decorators,
+        line_number=node.lineno,
+    )
+
+
+class _SinglePassVisitor(ast.NodeVisitor):
+    """
+    Single-pass AST visitor that collects all extraction info in one traversal.
+
+    This replaces the previous O(n*m) approach of calling ast.walk() for each
+    function to extract calls. Now we do ONE traversal and track context.
+    """
+
+    def __init__(self):
+        # Collected data
+        self.defined_names: set[str] = set()
+        self.imports: list[ImportInfo] = []
+        self.classes: list[ClassInfo] = []
+        self.functions: list[FunctionInfo] = []
+        self.call_graph = CallGraphInfo()
+
+        # Context tracking during traversal
+        self._class_stack: list[str] = []  # Stack of class names for nesting
+        self._func_stack: list[str] = []   # Stack of function names for nesting
+        self._current_caller: str | None = None  # Current function/method for call tracking
+
+        # Deferred nested function processing
+        self._nested_functions: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = []
+
+    def _get_qualified_name(self, name: str) -> str:
+        """Get qualified name including class path."""
+        if self._class_stack:
+            return f"{'.'.join(self._class_stack)}.{name}"
+        return name
+
+    def visit_Import(self, node: ast.Import):
+        """Handle import statements."""
+        for alias in node.names:
+            self.imports.append(ImportInfo(
+                module=alias.name,
+                names=[],
+                is_from=False,
+                line_number=node.lineno,
+            ))
+        # Don't visit children of import
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """Handle from...import statements."""
+        module_name = node.module or ""
+        names = [alias.name for alias in node.names]
+        self.imports.append(ImportInfo(
+            module=module_name,
+            names=names,
+            is_from=True,
+            line_number=node.lineno,
+        ))
+        # Don't visit children of import
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        """Handle class definitions."""
+        bases = [_node_to_str(base) for base in node.bases]
+        decorators = [_node_to_str(d) for d in node.decorator_list]
+
+        class_info = ClassInfo(
+            name=node.name,
+            bases=bases,
+            docstring=ast.get_docstring(node),
+            decorators=decorators,
+            line_number=node.lineno,
+        )
+
+        # Track class context for nested items
+        self._class_stack.append(node.name)
+
+        # Process class body for methods and nested classes
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Record method name for call graph filtering
+                self.defined_names.add(item.name)
+
+                # Extract method
+                method = _extract_function_info(item, is_method=True)
+                class_info.methods.append(method)
+
+                # Track method for call graph
+                caller_name = self._get_qualified_name(item.name)
+                old_caller = self._current_caller
+                self._current_caller = caller_name
+
+                # Visit method body for calls
+                self._visit_body_for_calls(item.body)
+
+                self._current_caller = old_caller
+
+            elif isinstance(item, ast.ClassDef):
+                # Nested class - recurse
+                self.visit_ClassDef(item)
+
+        self._class_stack.pop()
+        self.classes.append(class_info)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Handle function definitions."""
+        self._handle_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        """Handle async function definitions."""
+        self._handle_function(node)
+
+    def _handle_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        """Common handler for function/async function definitions."""
+        # Only process top-level functions here (not nested)
+        # Nested functions are handled when we visit their parent
+        if self._func_stack:
+            # This is a nested function - record it but don't add to functions yet
+            parent_name = self._func_stack[-1]
+            self._nested_functions.append((node, parent_name))
+            return
+
+        # Record defined name
+        self.defined_names.add(node.name)
+
+        # Extract function info
+        func_info = _extract_function_info(node, is_method=False)
+        self.functions.append(func_info)
+
+        # Track context for call extraction
+        self._func_stack.append(node.name)
+        old_caller = self._current_caller
+        self._current_caller = node.name
+
+        # Visit body for calls and nested functions
+        self._visit_body_for_calls_and_nested(node.body, node.name)
+
+        self._current_caller = old_caller
+        self._func_stack.pop()
+
+    def _visit_body_for_calls(self, body: list[ast.stmt]):
+        """Visit a function/method body to extract calls only."""
+        for stmt in body:
+            self._extract_calls_from_node(stmt)
+
+    def _visit_body_for_calls_and_nested(self, body: list[ast.stmt], parent_name: str):
+        """Visit a function body to extract calls and nested functions."""
+        for stmt in body:
+            # Check for nested function definitions
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Record defined name
+                self.defined_names.add(stmt.name)
+
+                # Extract nested function
+                func_info = _extract_function_info(stmt, is_method=False)
+                func_info.decorators.insert(0, f"nested_in:{parent_name}")
+                self.functions.append(func_info)
+
+                # Track calls from nested function
+                old_caller = self._current_caller
+                self._current_caller = stmt.name
+                self._visit_body_for_calls_and_nested(stmt.body, stmt.name)
+                self._current_caller = old_caller
+            else:
+                # Extract calls from this statement
+                self._extract_calls_from_node(stmt)
+
+    def _extract_calls_from_node(self, node: ast.AST):
+        """Extract all calls from an AST node (recursively)."""
+        if self._current_caller is None:
+            return
+
+        # Use iter_child_nodes to avoid creating new walk generators
+        nodes_to_visit = [node]
+        while nodes_to_visit:
+            current = nodes_to_visit.pop()
+
+            if isinstance(current, ast.Call):
+                callee = self._get_call_name(current)
+                if callee:
+                    # We'll filter by defined_names later
+                    # For now, record all calls
+                    self.call_graph.add_call(self._current_caller, callee)
+
+            # Skip nested function definitions - they have their own caller context
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+
+            # Add children to visit
+            nodes_to_visit.extend(ast.iter_child_nodes(current))
+
+    def _get_call_name(self, node: ast.Call) -> str | None:
+        """Get the name of a called function."""
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            # For method calls like self.method() or obj.method()
+            return node.func.attr
+        return None
+
+    def finalize(self, defined_names: set[str]):
+        """
+        Finalize extraction by filtering call graph to only defined names.
+
+        This is called after the first pass to filter external calls.
+        """
+        # Filter call graph to only include calls to defined functions
+        filtered_calls: dict[str, list[str]] = {}
+        for caller, callees in self.call_graph.calls.items():
+            filtered = [c for c in callees if c in defined_names]
+            if filtered:
+                filtered_calls[caller] = filtered
+
+        # Rebuild call graph with filtered data
+        self.call_graph = CallGraphInfo()
+        for caller, callees in filtered_calls.items():
+            for callee in callees:
+                self.call_graph.add_call(caller, callee)
+
+
 class PythonASTExtractor:
     """Extract code structure from Python files using AST."""
 
@@ -212,75 +536,28 @@ class PythonASTExtractor:
                 docstring=None,
             )
 
+        # Single-pass extraction using NodeVisitor
+        visitor = _SinglePassVisitor()
+
+        # Visit top-level nodes
+        for node in ast.iter_child_nodes(tree):
+            visitor.visit(node)
+
+        # Finalize: filter call graph to only defined functions
+        visitor.finalize(visitor.defined_names)
+
+        # Build module info from visitor results
         module_info = ModuleInfo(
             file_path=str(file_path),
             language="python",
             docstring=ast.get_docstring(tree),
+            imports=visitor.imports,
+            classes=visitor.classes,
+            functions=visitor.functions,
+            call_graph=visitor.call_graph,
         )
 
-        # First pass: collect all defined function/method names
-        defined_names: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                defined_names.add(node.name)
-
-        # Second pass: extract structure and calls
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    module_info.imports.append(ImportInfo(
-                        module=alias.name,
-                        names=[],
-                        is_from=False,
-                        line_number=node.lineno,
-                    ))
-
-            elif isinstance(node, ast.ImportFrom):
-                module_name = node.module or ""
-                names = [alias.name for alias in node.names]
-                module_info.imports.append(ImportInfo(
-                    module=module_name,
-                    names=names,
-                    is_from=True,
-                    line_number=node.lineno,
-                ))
-
-            elif isinstance(node, ast.ClassDef):
-                class_info = self._extract_class(
-                    node,
-                    call_graph=module_info.call_graph,
-                    defined_names=defined_names,
-                    module_info=module_info,
-                )
-                module_info.classes.append(class_info)
-
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_info = self._extract_function(node)
-                module_info.functions.append(func_info)
-                # Extract calls from this function
-                self._extract_calls(node, node.name, module_info.call_graph, defined_names)
-                # Extract nested functions
-                self._extract_nested_functions(node, module_info, defined_names)
-
         return module_info
-
-    def _extract_nested_functions(
-        self,
-        parent_node: ast.FunctionDef | ast.AsyncFunctionDef,
-        module_info: ModuleInfo,
-        defined_names: set[str],
-    ):
-        """Extract nested functions from a function body."""
-        for node in ast.walk(parent_node):
-            if node is parent_node:
-                continue  # Skip the parent itself
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                func_info = self._extract_function(node)
-                # Mark as nested for context
-                func_info.decorators.insert(0, f"nested_in:{parent_node.name}")
-                module_info.functions.append(func_info)
-                # Extract calls from this nested function
-                self._extract_calls(node, node.name, module_info.call_graph, defined_names)
 
     def _extract_class(
         self,

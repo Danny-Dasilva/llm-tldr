@@ -28,6 +28,16 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 
+# Precompiled regex patterns for diagnostic parsers
+# These patterns are used in loops, so precompiling avoids repeated compilation
+_TSC_PATTERN = re.compile(r"(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.+)")
+_GO_VET_PATTERN = re.compile(r"(.+?):(\d+):(\d+):\s*(.+)")
+_JAVAC_PATTERN = re.compile(r"(.+?):(\d+):\s*(error|warning):\s*(.+)")  # Also used by scalac
+_GCC_PATTERN = re.compile(r"(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)")  # Also kotlinc, swiftc
+_DOTNET_PATTERN = re.compile(r"(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(\w+):\s*(.+)")
+_MIX_PATTERN = re.compile(r"\*\*\s*\((\w+)\)\s*(.+?):(\d+):\s*(.+)")
+
+
 # Mapping of language -> tools configuration
 LANG_TOOLS: dict[str, dict] = {
     "python": {
@@ -167,9 +177,8 @@ def _parse_tsc_output(stderr: str) -> list[dict]:
     """Parse tsc output into structured diagnostics."""
     diagnostics = []
     # tsc format: file(line,col): error TSxxxx: message
-    pattern = r"(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _TSC_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -189,9 +198,8 @@ def _parse_go_vet_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # go vet format: file.go:line:col: message
-    pattern = r"(.+?):(\d+):(\d+):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _GO_VET_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -424,9 +432,8 @@ def _parse_javac_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # javac format: file.java:line: error: message
-    pattern = r"(.+?):(\d+):\s*(error|warning):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _JAVAC_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -470,9 +477,8 @@ def _parse_gcc_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # gcc format: file.c:line:col: error: message
-    pattern = r"(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _GCC_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -492,9 +498,8 @@ def _parse_kotlinc_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # kotlinc format: file.kt:line:col: error: message
-    pattern = r"(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _GCC_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -514,9 +519,8 @@ def _parse_swiftc_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # swiftc format: file.swift:line:col: error: message
-    pattern = r"(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _GCC_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -536,9 +540,8 @@ def _parse_dotnet_build_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # dotnet format: file.cs(line,col): error CS0000: message
-    pattern = r"(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(\w+):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _DOTNET_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -558,9 +561,8 @@ def _parse_scalac_output(stderr: str) -> list[dict]:
     if not stderr.strip():
         return diagnostics
     # scalac format varies, common: file.scala:line: error: message
-    pattern = r"(.+?):(\d+):\s*(error|warning):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _JAVAC_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(1),
@@ -582,9 +584,8 @@ def _parse_mix_compile_output(stderr: str) -> list[dict]:
     # mix compile format: warning: message
     #   file.ex:line
     # Or: ** (CompileError) file.ex:line: message
-    pattern = r"\*\*\s*\((\w+)\)\s*(.+?):(\d+):\s*(.+)"
     for line in stderr.strip().split("\n"):
-        match = re.match(pattern, line)
+        match = _MIX_PATTERN.match(line)
         if match:
             diagnostics.append({
                 "file": match.group(2),

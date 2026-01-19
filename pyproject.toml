@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "llm-tldr"
@@ -69,6 +69,7 @@ cli = [
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
+    "pytest-benchmark>=4.0",
     "black>=21.0",
     "flake8>=3.8",
     "mypy>=0.900",
@@ -87,13 +88,8 @@ tldr = "tldr.cli:main"
 llm-tldr = "tldr.cli:main"
 tldr-mcp = "tldr.mcp_server:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["tldr*"]
-exclude = ["tests*"]
-
-[tool.setuptools.package-data]
-tldr = ["py.typed"]
+[tool.hatch.build.targets.wheel]
+packages = ["tldr"]
 
 [tool.black]
 line-length = 88

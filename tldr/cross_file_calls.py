@@ -17,6 +17,7 @@ Key functions:
 import ast
 import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -134,7 +135,7 @@ except ImportError:
     pass
 
 
-@dataclass
+@dataclass(slots=True)
 class ProjectCallGraph:
     """Cross-file call graph with edges as (src_file, src_func, dst_file, dst_func)."""
 
@@ -154,152 +155,204 @@ class ProjectCallGraph:
         return edge in self._edges
 
 
+# Module-level parser cache for performance (parsers are expensive to create)
+_parser_cache: dict[str, object] = {}
+
+
 def _get_ts_parser():
     """Get or create a tree-sitter TypeScript parser."""
+    if "typescript" in _parser_cache:
+        return _parser_cache["typescript"]
+
     if not TREE_SITTER_AVAILABLE:
         raise RuntimeError("tree-sitter-typescript not available")
 
     ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
     parser = tree_sitter.Parser(ts_lang)
+    _parser_cache["typescript"] = parser
     return parser
 
 
 def _get_rust_parser():
     """Get or create a tree-sitter Rust parser."""
+    if "rust" in _parser_cache:
+        return _parser_cache["rust"]
+
     if not TREE_SITTER_RUST_AVAILABLE:
         raise RuntimeError("tree-sitter-rust not available")
 
     rust_lang = tree_sitter.Language(tree_sitter_rust.language())
     parser = tree_sitter.Parser(rust_lang)
+    _parser_cache["rust"] = parser
     return parser
 
 
 def _get_go_parser():
     """Get or create a tree-sitter Go parser."""
+    if "go" in _parser_cache:
+        return _parser_cache["go"]
+
     if not TREE_SITTER_GO_AVAILABLE:
         raise RuntimeError("tree-sitter-go not available")
 
     go_lang = tree_sitter.Language(tree_sitter_go.language())
     parser = tree_sitter.Parser(go_lang)
+    _parser_cache["go"] = parser
     return parser
 
 
 def _get_java_parser():
     """Get or create a tree-sitter Java parser."""
+    if "java" in _parser_cache:
+        return _parser_cache["java"]
+
     if not TREE_SITTER_JAVA_AVAILABLE:
         raise RuntimeError("tree-sitter-java not available")
 
     java_lang = tree_sitter.Language(tree_sitter_java.language())
     parser = tree_sitter.Parser(java_lang)
+    _parser_cache["java"] = parser
     return parser
 
 
 def _get_c_parser():
     """Get or create a tree-sitter C parser."""
+    if "c" in _parser_cache:
+        return _parser_cache["c"]
+
     if not TREE_SITTER_C_AVAILABLE:
         raise RuntimeError("tree-sitter-c not available")
 
     c_lang = tree_sitter.Language(tree_sitter_c.language())
     parser = tree_sitter.Parser(c_lang)
+    _parser_cache["c"] = parser
     return parser
 
 
 def _get_ruby_parser():
     """Get or create a tree-sitter Ruby parser."""
+    if "ruby" in _parser_cache:
+        return _parser_cache["ruby"]
+
     if not TREE_SITTER_RUBY_AVAILABLE:
         raise RuntimeError("tree-sitter-ruby not available")
 
     ruby_lang = tree_sitter.Language(tree_sitter_ruby.language())
     parser = tree_sitter.Parser(ruby_lang)
+    _parser_cache["ruby"] = parser
     return parser
 
 
 def _get_php_parser():
     """Get or create a tree-sitter PHP parser."""
+    if "php" in _parser_cache:
+        return _parser_cache["php"]
+
     if not TREE_SITTER_PHP_AVAILABLE:
         raise RuntimeError("tree-sitter-php not available")
 
     php_lang = tree_sitter.Language(tree_sitter_php.language_php())
     parser = tree_sitter.Parser(php_lang)
+    _parser_cache["php"] = parser
     return parser
 
 
 def _get_cpp_parser():
     """Get or create a tree-sitter C++ parser."""
+    if "cpp" in _parser_cache:
+        return _parser_cache["cpp"]
+
     if not TREE_SITTER_CPP_AVAILABLE:
         raise RuntimeError("tree-sitter-cpp not available")
 
     cpp_lang = tree_sitter.Language(tree_sitter_cpp.language())
     parser = tree_sitter.Parser(cpp_lang)
+    _parser_cache["cpp"] = parser
     return parser
 
 
 def _get_kotlin_parser():
     """Get or create a tree-sitter Kotlin parser."""
+    if "kotlin" in _parser_cache:
+        return _parser_cache["kotlin"]
+
     if not TREE_SITTER_KOTLIN_AVAILABLE:
         raise RuntimeError("tree-sitter-kotlin not available")
 
     kotlin_lang = tree_sitter.Language(tree_sitter_kotlin.language())
     parser = tree_sitter.Parser(kotlin_lang)
+    _parser_cache["kotlin"] = parser
     return parser
 
 
 def _get_swift_parser():
     """Get or create a tree-sitter Swift parser."""
+    if "swift" in _parser_cache:
+        return _parser_cache["swift"]
+
     if not TREE_SITTER_SWIFT_AVAILABLE:
         raise RuntimeError("tree-sitter-swift not available")
 
     swift_lang = tree_sitter.Language(tree_sitter_swift.language())
     parser = tree_sitter.Parser(swift_lang)
+    _parser_cache["swift"] = parser
     return parser
 
 
 def _get_csharp_parser():
     """Get or create a tree-sitter C# parser."""
+    if "csharp" in _parser_cache:
+        return _parser_cache["csharp"]
+
     if not TREE_SITTER_CSHARP_AVAILABLE:
         raise RuntimeError("tree-sitter-c-sharp not available")
 
     csharp_lang = tree_sitter.Language(tree_sitter_c_sharp.language())
     parser = tree_sitter.Parser(csharp_lang)
+    _parser_cache["csharp"] = parser
     return parser
 
 
 def _get_scala_parser():
     """Get or create a tree-sitter Scala parser."""
+    if "scala" in _parser_cache:
+        return _parser_cache["scala"]
+
     if not TREE_SITTER_SCALA_AVAILABLE:
         raise RuntimeError("tree-sitter-scala not available")
 
     scala_lang = tree_sitter.Language(tree_sitter_scala.language())
     parser = tree_sitter.Parser(scala_lang)
+    _parser_cache["scala"] = parser
     return parser
 
 
-def scan_project(
-    root: str | Path,
-    language: str = "python",
-    workspace_config: Optional[WorkspaceConfig] = None,
+@lru_cache(maxsize=128)
+def _scan_project_cached(
+    root: str,
+    language: str,
+    workspace_config_key: Optional[tuple] = None,
     respect_ignore: bool = True,
-) -> list[str]:
+) -> tuple[str, ...]:
     """
-    Find all source files in the project for the given language.
+    Cached implementation of scan_project with hashable arguments.
 
     Args:
-        root: Project root directory
-        language: "python", "typescript", "go", or "rust"
-        workspace_config: Optional WorkspaceConfig for monorepo scoping.
-                         If provided, filters files by activePackages and excludePatterns.
-        respect_ignore: If True, respect .tldrignore patterns (default True)
+        root: Project root directory (as string)
+        language: Language to scan for
+        workspace_config_key: Tuple of (active_packages_tuple, exclude_patterns_tuple) or None
+        respect_ignore: If True, respect .tldrignore patterns
 
     Returns:
-        List of absolute paths to source files
+        Tuple of absolute paths to source files (tuple for hashability)
     """
     from .tldrignore import load_ignore_patterns, should_ignore
 
-    root = Path(root)
+    root_path = Path(root)
     files = []
 
     # Load ignore patterns if respecting .tldrignore
-    ignore_spec = load_ignore_patterns(root) if respect_ignore else None
+    ignore_spec = load_ignore_patterns(root_path) if respect_ignore else None
 
     if language == "python":
         extensions = {'.py'}
@@ -338,18 +391,18 @@ def scan_project(
     else:
         raise ValueError(f"Unsupported language: {language}")
 
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root_path):
         # Skip ignored directories (modifying dirnames in-place prunes os.walk)
         if respect_ignore and ignore_spec:
-            rel_dir = os.path.relpath(dirpath, root)
+            rel_dir = os.path.relpath(dirpath, root_path)
             # Check if current directory should be ignored
-            if rel_dir != '.' and should_ignore(rel_dir + '/', root, ignore_spec):
+            if rel_dir != '.' and should_ignore(rel_dir + '/', root_path, ignore_spec):
                 dirnames.clear()  # Don't descend into ignored directories
                 continue
             # Filter subdirectories
             dirnames[:] = [
                 d for d in dirnames
-                if not should_ignore(os.path.join(rel_dir, d) + '/', root, ignore_spec)
+                if not should_ignore(os.path.join(rel_dir, d) + '/', root_path, ignore_spec)
             ]
 
         for filename in filenames:
@@ -357,37 +410,75 @@ def scan_project(
                 file_path = os.path.join(dirpath, filename)
                 # Check individual file against ignore patterns
                 if respect_ignore and ignore_spec:
-                    rel_path = os.path.relpath(file_path, root)
-                    if should_ignore(rel_path, root, ignore_spec):
+                    rel_path = os.path.relpath(file_path, root_path)
+                    if should_ignore(rel_path, root_path, ignore_spec):
                         continue
                 files.append(file_path)
 
     # Apply workspace config filtering if provided
-    if workspace_config is not None:
+    if workspace_config_key is not None:
+        active_packages, exclude_patterns = workspace_config_key
+        workspace_config = WorkspaceConfig(
+            active_packages=list(active_packages),
+            exclude_patterns=list(exclude_patterns),
+        )
         # Convert absolute paths to relative for filtering, then back to absolute
-        rel_files = [os.path.relpath(f, root) for f in files]
+        rel_files = [os.path.relpath(f, root_path) for f in files]
         filtered_rel = filter_paths(rel_files, workspace_config)
-        files = [os.path.join(root, f) for f in filtered_rel]
+        files = [os.path.join(root_path, f) for f in filtered_rel]
 
-    return files
+    return tuple(files)
 
 
-def parse_imports(file_path: str | Path) -> list[dict]:
+def scan_project(
+    root: str | Path,
+    language: str = "python",
+    workspace_config: Optional[WorkspaceConfig] = None,
+    respect_ignore: bool = True,
+) -> list[str]:
     """
-    Extract import statements from a Python file.
+    Find all source files in the project for the given language.
 
     Args:
-        file_path: Path to Python file
+        root: Project root directory
+        language: "python", "typescript", "go", or "rust"
+        workspace_config: Optional WorkspaceConfig for monorepo scoping.
+                         If provided, filters files by activePackages and excludePatterns.
+        respect_ignore: If True, respect .tldrignore patterns (default True)
 
     Returns:
-        List of import info dicts with keys: module, names, is_from, aliases
+        List of absolute paths to source files
     """
-    file_path = Path(file_path)
+    # Convert workspace_config to hashable key for caching
+    workspace_config_key = None
+    if workspace_config is not None:
+        workspace_config_key = (
+            tuple(workspace_config.active_packages),
+            tuple(workspace_config.exclude_patterns),
+        )
+
+    # Call cached implementation and convert result back to list
+    return list(_scan_project_cached(
+        str(root),
+        language,
+        workspace_config_key,
+        respect_ignore,
+    ))
+
+
+@lru_cache(maxsize=256)
+def _parse_imports_cached(file_path: str) -> tuple:
+    """
+    Cached implementation of parse_imports.
+
+    Returns tuple of tuples for immutability in cache.
+    """
+    path = Path(file_path)
     try:
-        source = file_path.read_text()
+        source = path.read_text()
         tree = ast.parse(source)
     except (SyntaxError, FileNotFoundError):
-        return []
+        return ()
 
     imports = []
 
@@ -415,7 +506,22 @@ def parse_imports(file_path: str | Path) -> list[dict]:
                     'aliases': aliases,
                 })
 
-    return imports
+    # Return as tuple for cache safety (caller will convert back to list)
+    return tuple(imports)
+
+
+def parse_imports(file_path: str | Path) -> list[dict]:
+    """
+    Extract import statements from a Python file.
+
+    Args:
+        file_path: Path to Python file
+
+    Returns:
+        List of import info dicts with keys: module, names, is_from, aliases
+    """
+    # Call cached implementation and convert back to list
+    return list(_parse_imports_cached(str(file_path)))
 
 
 def parse_ts_imports(file_path: str | Path) -> list[dict]:
@@ -1179,11 +1285,15 @@ def _parse_ruby_require_node(node, source: bytes) -> dict | None:
 
 def _get_lua_parser():
     """Get or create a tree-sitter Lua parser."""
+    if "lua" in _parser_cache:
+        return _parser_cache["lua"]
+
     if not TREE_SITTER_LUA_AVAILABLE:
         raise RuntimeError("tree-sitter-lua not available")
 
     lua_lang = tree_sitter.Language(tree_sitter_lua.language())
     parser = tree_sitter.Parser(lua_lang)
+    _parser_cache["lua"] = parser
     return parser
 
 
@@ -1303,11 +1413,15 @@ except ImportError:
 
 def _get_luau_parser():
     """Get or create a tree-sitter Luau parser."""
+    if "luau" in _parser_cache:
+        return _parser_cache["luau"]
+
     if not TREE_SITTER_LUAU_AVAILABLE:
         raise RuntimeError("tree-sitter-luau not available")
 
     luau_lang = tree_sitter.Language(tree_sitter_luau.language())
     parser = tree_sitter.Parser(luau_lang)
+    _parser_cache["luau"] = parser
     return parser
 
 
@@ -1484,9 +1598,13 @@ def parse_elixir_imports(file_path: str | Path) -> list[dict]:
 
 def _get_elixir_parser():
     """Get or create an Elixir tree-sitter parser."""
+    if "elixir" in _parser_cache:
+        return _parser_cache["elixir"]
+
     from tree_sitter import Language, Parser
     parser = Parser()
     parser.language = Language(tree_sitter_elixir.language())
+    _parser_cache["elixir"] = parser
     return parser
 
 
@@ -2414,15 +2532,20 @@ class CallVisitor(ast.NodeVisitor):
 
     def __init__(self, defined_funcs: set[str] | None = None):
         self.calls: list[str] = []
+        self._calls_set: set[str] = set()  # Shadow set for O(1) lookup
         self.attr_calls: list[tuple[str, str]] = []  # (obj, method) pairs
         self.refs: list[str] = []  # Function references (higher-order usage)
+        self._refs_set: set[str] = set()  # Shadow set for O(1) lookup
         self._defined_funcs = defined_funcs or set()
         self._in_call = False  # Track if we're inside a Call node
 
     def visit_Call(self, node: ast.Call):
         if isinstance(node.func, ast.Name):
-            # Direct call: func()
-            self.calls.append(node.func.id)
+            # Direct call: func() - use O(1) set lookup
+            call_id = node.func.id
+            if call_id not in self._calls_set:
+                self.calls.append(call_id)
+                self._calls_set.add(call_id)
         elif isinstance(node.func, ast.Attribute):
             # Attribute call: obj.method() or module.func()
             if isinstance(node.func.value, ast.Name):
@@ -2440,33 +2563,38 @@ class CallVisitor(ast.NodeVisitor):
 
     def visit_Name(self, node: ast.Name):
         # Track function references (not calls) when used as values
-        # Only track if it matches a known function name
-        if node.id in self._defined_funcs and node.id not in self.calls:
-            self.refs.append(node.id)
+        # Only track if it matches a known function name - use O(1) set lookup
+        if node.id in self._defined_funcs and node.id not in self._calls_set:
+            if node.id not in self._refs_set:
+                self.refs.append(node.id)
+                self._refs_set.add(node.id)
         self.generic_visit(node)
 
     def visit_Dict(self, node: ast.Dict):
         # Track function references in dict values: {"key": func}
         for value in node.values:
             if isinstance(value, ast.Name) and value.id in self._defined_funcs:
-                if value.id not in self.refs:
+                if value.id not in self._refs_set:  # O(1) lookup
                     self.refs.append(value.id)
+                    self._refs_set.add(value.id)
         self.generic_visit(node)
 
     def visit_List(self, node: ast.List):
         # Track function references in lists: [func1, func2]
         for elt in node.elts:
             if isinstance(elt, ast.Name) and elt.id in self._defined_funcs:
-                if elt.id not in self.refs:
+                if elt.id not in self._refs_set:  # O(1) lookup
                     self.refs.append(elt.id)
+                    self._refs_set.add(elt.id)
         self.generic_visit(node)
 
     def visit_Tuple(self, node: ast.Tuple):
         # Track function references in tuples: (func1, func2)
         for elt in node.elts:
             if isinstance(elt, ast.Name) and elt.id in self._defined_funcs:
-                if elt.id not in self.refs:
+                if elt.id not in self._refs_set:  # O(1) lookup
                     self.refs.append(elt.id)
+                    self._refs_set.add(elt.id)
         self.generic_visit(node)
 
 
@@ -3504,6 +3632,16 @@ def _build_go_call_graph(
     workspace_config: Optional[WorkspaceConfig] = None
 ):
     """Build call graph for Go files."""
+    # Build reverse lookup: func_name -> list of (module, file_path)
+    # This avoids O(n^2) iteration over func_index for each call
+    func_name_lookup: dict[str, list[tuple[str, str]]] = {}
+    for key, file_path in func_index.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            mod, name = key
+            if name not in func_name_lookup:
+                func_name_lookup[name] = []
+            func_name_lookup[name].append((mod, file_path))
+
     for go_file in scan_project(root, "go", workspace_config):
         go_path = Path(go_file)
         rel_path = str(go_path.relative_to(root))
@@ -3548,17 +3686,13 @@ def _build_go_call_graph(
                         pkg, func_name = parts
                         if pkg in package_imports:
                             pkg_path = package_imports[pkg]
-                            # Try to find in function index
-                            # For Go packages, look in all files in the package directory
-                            for key, file_path in func_index.items():
-                                # Handle both tuple keys (mod, name) and string keys
-                                if isinstance(key, tuple) and len(key) == 2:
-                                    mod, name = key
-                                    if name == func_name:
-                                        # Check if this file is in the right package
-                                        if pkg_path.lstrip('./') in file_path or mod == pkg:
-                                            graph.add_edge(rel_path, caller_func, file_path, func_name)
-                                            break
+                            # Use O(1) lookup by function name instead of iterating all keys
+                            candidates = func_name_lookup.get(func_name, [])
+                            for mod, file_path in candidates:
+                                # Check if this file is in the right package
+                                if pkg_path.lstrip('./') in file_path or mod == pkg:
+                                    graph.add_edge(rel_path, caller_func, file_path, func_name)
+                                    break
 
 
 def _resolve_go_import(from_file: str, import_path: str) -> str:

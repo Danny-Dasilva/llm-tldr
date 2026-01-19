@@ -14,10 +14,17 @@ Usage:
     # Returns LLM-ready string with call graph, signatures, complexity
 """
 
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# Threshold: only parallelize above this file count
+# ProcessPoolExecutor overhead dominates for small projects
+_PARALLEL_THRESHOLD = int(os.environ.get('TLDR_PARALLEL_THRESHOLD', '100'))
+_MAX_WORKERS = int(os.environ.get('TLDR_MAX_WORKERS', '4'))
 
 from .ast_extractor import (
     CallGraphInfo,  # Re-exported for API consumers
@@ -1384,6 +1391,55 @@ def get_file_tree(
     return scan_dir(root)
 
 
+def _search_file(
+    file_path: Path,
+    pattern: str,
+    root: Path,
+    context_lines: int = 0,
+) -> list[dict]:
+    """Search a single file for pattern matches.
+
+    Helper function for parallel search. Must be top-level for pickling.
+
+    Args:
+        file_path: Path to file to search
+        pattern: Regex pattern string
+        root: Root directory for relative path calculation
+        context_lines: Number of context lines to include
+
+    Returns:
+        List of match dicts for this file
+    """
+    import re
+
+    results = []
+    compiled = re.compile(pattern)
+
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        lines = content.splitlines()
+
+        for i, line in enumerate(lines, 1):
+            if compiled.search(line):
+                match = {
+                    "file": str(file_path.relative_to(root)),
+                    "line": i,
+                    "content": line.strip(),
+                }
+
+                # Add context if requested
+                if context_lines > 0:
+                    start = max(0, i - 1 - context_lines)
+                    end = min(len(lines), i + context_lines)
+                    match["context"] = lines[start:end]
+
+                results.append(match)
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    return results
+
+
 def search(
     pattern: str,
     root: str | Path,
@@ -1395,6 +1451,9 @@ def search(
 ) -> list[dict]:
     """
     Search files for a regex pattern.
+
+    Uses smart parallelization: sequential for small projects (<100 files),
+    parallel ProcessPoolExecutor for large projects (>=100 files).
 
     Args:
         pattern: Regex pattern to search for
@@ -1418,56 +1477,48 @@ def search(
     # Security: Validate path containment
     _validate_path_containment(str(root))
 
-    import re
-
-    # Fallback directories to skip if no ignore_spec provided
-    SKIP_DIRS = {
-        "node_modules", "__pycache__", ".git", ".svn", ".hg",
-        "dist", "build", ".next", ".nuxt", "coverage", ".tox",
-        "venv", ".venv", "env", ".env", "vendor", ".cache",
-    }
-
-    results = []
     root = Path(root)
-    compiled = re.compile(pattern)
-    files_scanned = 0
 
     # Use _iter_files_with_ignore for efficient directory pruning
     all_files = _iter_files_with_ignore(root, extensions)
-    for file_path in all_files:
-        # Check file limit
-        if max_files > 0 and files_scanned >= max_files:
-            break
 
-        files_scanned += 1
+    # Apply file limit
+    if max_files > 0:
+        all_files = all_files[:max_files]
 
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
-            lines = content.splitlines()
-
-            for i, line in enumerate(lines, 1):
-                if compiled.search(line):
-                    match = {
-                        "file": str(file_path.relative_to(root)),
-                        "line": i,
-                        "content": line.strip(),
-                    }
-
-                    # Add context if requested
-                    if context_lines > 0:
-                        start = max(0, i - 1 - context_lines)
-                        end = min(len(lines), i + context_lines)
-                        match["context"] = lines[start:end]
-
-                    results.append(match)
-
-                    # Check result limit
+    # Smart parallelization: only use ProcessPoolExecutor above threshold
+    if len(all_files) < _PARALLEL_THRESHOLD:
+        # Sequential for small projects (faster due to no overhead)
+        results = []
+        for file_path in all_files:
+            file_results = _search_file(file_path, pattern, root, context_lines)
+            results.extend(file_results)
+            # Check result limit
+            if max_results > 0 and len(results) >= max_results:
+                return results[:max_results]
+        return results
+    else:
+        # Parallel for large projects
+        results = []
+        with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_search_file, f, pattern, root, context_lines): f
+                for f in all_files
+            }
+            for future in as_completed(futures):
+                try:
+                    file_results = future.result()
+                    results.extend(file_results)
+                    # Check result limit (approximate - may slightly exceed)
                     if max_results > 0 and len(results) >= max_results:
-                        return results
-        except (OSError, UnicodeDecodeError):
-            pass
-
-    return results
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
+                        return results[:max_results]
+                except Exception:
+                    # Skip files that fail
+                    pass
+        return results[:max_results] if max_results > 0 else results
 
 
 class Selection:
@@ -1520,6 +1571,45 @@ class Selection:
         return len(self._selected)
 
 
+def _extract_file_structure(file_path: Path, root: Path) -> dict | None:
+    """Extract code structure from a single file.
+
+    Helper function for parallel extraction. Must be top-level for pickling.
+
+    Args:
+        file_path: Path to file to analyze
+        root: Root directory for relative path calculation
+
+    Returns:
+        Dict with file structure, or None if extraction fails
+    """
+    try:
+        info = _extract_file_impl(str(file_path))
+        info_dict = info.to_dict()
+
+        # Collect top-level functions
+        functions = [f["name"] for f in info_dict.get("functions", [])]
+
+        # Collect class methods
+        methods = []
+        for cls in info_dict.get("classes", []):
+            for method in cls.get("methods", []):
+                method_name = method.get("name", "")
+                if method_name:
+                    methods.append(method_name)  # Plain method name
+                    functions.append(method_name)  # Also in functions for discoverability
+
+        return {
+            "path": str(file_path.relative_to(root)),
+            "functions": functions,  # Includes both functions and methods
+            "classes": [c["name"] for c in info_dict.get("classes", [])],
+            "methods": methods,  # Methods only (for filtering)
+            "imports": info_dict.get("imports", []),
+        }
+    except Exception:
+        return None
+
+
 def get_code_structure(
     root: str | Path,
     language: str = "python",
@@ -1528,6 +1618,9 @@ def get_code_structure(
 ) -> dict:
     """
     Get code structure (codemaps) for all files in a project.
+
+    Uses smart parallelization: sequential for small projects (<100 files),
+    parallel ProcessPoolExecutor for large projects (>=100 files).
 
     Args:
         root: Root directory to analyze
@@ -1577,43 +1670,48 @@ def get_code_structure(
 
     result = {"root": str(root), "language": language, "files": []}
 
-    count = 0
     # Use _iter_files_with_ignore for efficient directory pruning
     all_files = _iter_files_with_ignore(root, extensions)
-    for file_path in all_files:
-        if count >= max_results:
-            break
 
-        try:
-            info = _extract_file_impl(str(file_path))
-            info_dict = info.to_dict()
+    # Smart parallelization: only use ProcessPoolExecutor above threshold
+    if len(all_files) < _PARALLEL_THRESHOLD:
+        # Sequential for small projects (faster due to no overhead)
+        count = 0
+        for file_path in all_files:
+            if count >= max_results:
+                break
 
-            # Collect top-level functions
-            functions = [f["name"] for f in info_dict.get("functions", [])]
+            file_entry = _extract_file_structure(file_path, root)
+            if file_entry is not None:
+                result["files"].append(file_entry)
+                count += 1
+    else:
+        # Parallel for large projects
+        # Limit files to process based on max_results (with buffer for failures)
+        files_to_process = all_files[:max_results * 2] if max_results > 0 else all_files
 
-            # Collect class methods
-            methods = []
-            for cls in info_dict.get("classes", []):
-                cls_name = cls.get("name", "")
-                for method in cls.get("methods", []):
-                    method_name = method.get("name", "")
-                    if method_name:
-                        methods.append(method_name)  # Plain method name
-                        functions.append(method_name)  # Also in functions for discoverability
-
-            file_entry = {
-                "path": str(file_path.relative_to(root)),
-                "functions": functions,  # Includes both functions and methods
-                "classes": [c["name"] for c in info_dict.get("classes", [])],
-                "methods": methods,  # Methods only (for filtering)
-                "imports": info_dict.get("imports", []),
+        with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_extract_file_structure, f, root): f
+                for f in files_to_process
             }
+            for future in as_completed(futures):
+                try:
+                    file_entry = future.result()
+                    if file_entry is not None:
+                        result["files"].append(file_entry)
+                        # Check result limit
+                        if max_results > 0 and len(result["files"]) >= max_results:
+                            # Cancel remaining futures
+                            for f in futures:
+                                f.cancel()
+                            break
+                except Exception:
+                    pass
 
-            result["files"].append(file_entry)
-            count += 1
-        except Exception:
-            # Skip files that can't be parsed
-            pass
+        # Trim to max_results
+        if max_results > 0:
+            result["files"] = result["files"][:max_results]
 
     return result
 

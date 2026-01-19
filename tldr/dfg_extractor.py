@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class VarRef:
     """
     A reference to a variable (definition or use).
@@ -43,7 +43,7 @@ class VarRef:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class DataflowEdge:
     """
     A def-use relationship connecting a definition to a use.
@@ -418,6 +418,26 @@ class CFGReachingDefsAnalyzer:
                         kill[block.id].add(def_ref.name)
 
         # Worklist algorithm - iterate until fixed point
+        # OPTIMIZATION: Use sets for O(1) membership checks instead of O(n) list checks
+        # reaching_in_sets[block_id] = {var_name: set of (line, col) tuples for fast dedup}
+        reaching_in_sets: dict[int, dict[str, set[tuple[int, int]]]] = {
+            b.id: {} for b in self.cfg.blocks
+        }
+        reaching_out_sets: dict[int, dict[str, set[tuple[int, int]]]] = {
+            b.id: {} for b in self.cfg.blocks
+        }
+
+        # Map (line, col) -> VarRef for reconstruction
+        ref_lookup: dict[tuple[int, int], VarRef] = {}
+        for ref in self.refs:
+            ref_lookup[(ref.line, ref.column)] = ref
+
+        # Convert gen to sets
+        gen_sets: dict[int, dict[str, set[tuple[int, int]]]] = {b.id: {} for b in self.cfg.blocks}
+        for block_id, var_defs in gen.items():
+            for var_name, defs in var_defs.items():
+                gen_sets[block_id][var_name] = {(d.line, d.column) for d in defs}
+
         changed = True
         max_iterations = 100  # Safety limit
         iteration = 0
@@ -428,42 +448,44 @@ class CFGReachingDefsAnalyzer:
 
             for block in self.cfg.blocks:
                 # Compute reaching_in = merge of predecessor reaching_out
-                new_reaching_in: dict[str, list[VarRef]] = {}
+                # OPTIMIZATION: Use set union for O(1) amortized membership
+                new_reaching_in: dict[str, set[tuple[int, int]]] = {}
 
                 for pred_id in self.predecessors[block.id]:
-                    for var_name, defs in reaching_out[pred_id].items():
+                    for var_name, def_keys in reaching_out_sets[pred_id].items():
                         if var_name not in new_reaching_in:
-                            new_reaching_in[var_name] = []
-                        # Merge: add all reaching defs (may have duplicates)
-                        for d in defs:
-                            if d not in new_reaching_in[var_name]:
-                                new_reaching_in[var_name].append(d)
+                            new_reaching_in[var_name] = set()
+                        # Set union is O(min(len(a), len(b))) amortized
+                        new_reaching_in[var_name].update(def_keys)
 
                 # Compute reaching_out = gen ∪ (reaching_in - kill)
-                new_reaching_out: dict[str, list[VarRef]] = {}
+                new_reaching_out: dict[str, set[tuple[int, int]]] = {}
 
-                # First: pass through defs that aren't killed
-                for var_name, defs in new_reaching_in.items():
+                # First: pass through defs that aren't killed (no copy needed - create new set)
+                for var_name, def_keys in new_reaching_in.items():
                     if var_name not in kill[block.id]:
-                        new_reaching_out[var_name] = defs.copy()
+                        new_reaching_out[var_name] = def_keys  # Share reference, will be replaced if gen
 
                 # Then: add generated defs (these override)
-                for var_name, defs in gen[block.id].items():
-                    new_reaching_out[var_name] = defs.copy()
+                for var_name, def_keys in gen_sets[block.id].items():
+                    new_reaching_out[var_name] = def_keys  # Override with gen set
 
-                # Check if changed
-                if new_reaching_in != reaching_in[block.id]:
+                # Check if changed - set comparison is O(n) but with fast short-circuit
+                if new_reaching_in != reaching_in_sets[block.id]:
                     changed = True
-                    reaching_in[block.id] = new_reaching_in
+                    reaching_in_sets[block.id] = new_reaching_in
 
-                if new_reaching_out != reaching_out[block.id]:
+                if new_reaching_out != reaching_out_sets[block.id]:
                     changed = True
-                    reaching_out[block.id] = new_reaching_out
+                    reaching_out_sets[block.id] = new_reaching_out
 
         # Build edges from reaching defs to uses
         for block in self.cfg.blocks:
-            # Get reaching defs at start of block - DEEP COPY
-            block_reaching = {k: list(v) for k, v in reaching_in[block.id].items()}
+            # Convert sets back to VarRef lists for this block
+            # OPTIMIZATION: Only convert once per block, not per iteration
+            block_reaching: dict[str, list[VarRef]] = {}
+            for var_name, def_keys in reaching_in_sets[block.id].items():
+                block_reaching[var_name] = [ref_lookup[k] for k in def_keys if k in ref_lookup]
 
             for line in self._get_block_lines(block):
                 # Only process lines that this block owns
