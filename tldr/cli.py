@@ -754,7 +754,9 @@ Semantic Search:
                 max_files=args.max_files,
                 ignore_spec=ignore_spec,
             )
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("search", str(Path(args.path).resolve()), output)
 
         elif args.command == "extract":
             result = extract_file(args.file)
@@ -802,7 +804,9 @@ Semantic Search:
                     if filter_class:
                         result["functions"] = []
 
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("extract", str(Path(args.file).resolve().parent), output)
 
         elif args.command == "context":
             ctx = get_relevant_context(
@@ -816,12 +820,16 @@ Semantic Search:
         elif args.command == "cfg":
             lang = args.lang or detect_language_from_extension(args.file)
             result = get_cfg_context(args.file, args.function, language=lang)
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("cfg", str(Path(args.file).resolve().parent), output)
 
         elif args.command == "dfg":
             lang = args.lang or detect_language_from_extension(args.file)
             result = get_dfg_context(args.file, args.function, language=lang)
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("dfg", str(Path(args.file).resolve().parent), output)
 
         elif args.command == "slice":
             lang = args.lang or detect_language_from_extension(args.file)
@@ -834,7 +842,9 @@ Semantic Search:
                 language=lang,
             )
             result = {"lines": sorted(lines), "count": len(lines)}
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("slice", str(Path(args.file).resolve().parent), output)
 
         elif args.command == "calls":
             # Check for cached graph and dirty files for incremental update
@@ -878,12 +888,16 @@ Semantic Search:
                 entry_points=args.entry if args.entry else None,
                 language=lang,
             )
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("dead", str(Path(args.path).resolve()), output)
 
         elif args.command == "arch":
             lang = resolve_language(args.lang, args.path)
             result = analyze_architecture(args.path, language=lang)
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("arch", str(Path(args.path).resolve()), output)
 
         elif args.command == "imports":
             file_path = Path(args.file).resolve()
@@ -892,7 +906,9 @@ Semantic Search:
                 sys.exit(1)
             lang = args.lang or detect_language_from_extension(args.file)
             result = get_imports(str(file_path), language=lang)
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("imports", str(file_path.parent), output)
 
         elif args.command == "importers":
             # Find all files that import the given module
@@ -921,7 +937,9 @@ Semantic Search:
                     # Skip files that can't be parsed
                     pass
 
-            print(json.dumps({"module": args.module, "importers": importers}, indent=2))
+            output = json.dumps({"module": args.module, "importers": importers}, indent=2)
+            print(output)
+            _track_usage("importers", str(project), output)
 
         elif args.command == "change-impact":
             from .change_impact import analyze_change_impact
@@ -944,7 +962,9 @@ Semantic Search:
                 print(f"Running: {shlex.join(cmd)}", file=sys.stderr)
                 sp.run(cmd)  # No shell=True - safe from injection
             else:
-                print(json.dumps(result, indent=2))
+                output = json.dumps(result, indent=2)
+                print(output)
+                _track_usage("change-impact", str(Path(".").resolve()), output)
 
         elif args.command == "diagnostics":
             from .diagnostics import (
@@ -972,9 +992,13 @@ Semantic Search:
                 )
 
             if args.format == "text":
-                print(format_diagnostics_for_llm(result))
+                output = format_diagnostics_for_llm(result)
+                print(output)
+                _track_usage("diagnostics", str(target if target.is_dir() else target.parent), output)
             else:
-                print(json.dumps(result, indent=2))
+                output = json.dumps(result, indent=2)
+                print(output)
+                _track_usage("diagnostics", str(target if target.is_dir() else target.parent), output)
 
         elif args.command == "warm":
             import os
@@ -1088,7 +1112,9 @@ Semantic Search:
                 try:
                     respect_ignore = not getattr(args, 'no_ignore', False)
                     count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
-                    print(f"Indexed {count} code units")
+                    output = f"Indexed {count} code units"
+                    print(output)
+                    _track_usage("semantic_index", str(Path(args.path).resolve()), output)
                 finally:
                     _release_reindex_lock(lock_fd)
 
@@ -1100,7 +1126,9 @@ Semantic Search:
                     expand_graph=args.expand,
                     model=args.model,
                 )
-                print(json.dumps(results, indent=2))
+                output = json.dumps(results, indent=2)
+                print(output)
+                _track_usage("semantic_search", str(Path(args.path).resolve()), output)
 
         elif args.command == "doctor":
             import shutil
