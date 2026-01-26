@@ -14,6 +14,8 @@ Usage:
     tldr stats [path]                   Show token savings dashboard
 """
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -31,6 +33,42 @@ if os.name == 'nt':
         pass
 
 from . import __version__
+
+
+def _get_reindex_lock_path(project_path: str) -> str:
+    """Get project-specific reindex lock file path."""
+    project_hash = hashlib.md5(str(Path(project_path).resolve()).encode()).hexdigest()[:8]
+    return f"/tmp/tldr-reindex-{project_hash}.lock"
+
+
+def _acquire_reindex_lock(project_path: str):
+    """
+    Acquire cross-process reindex lock. Returns lock file descriptor or None.
+
+    This prevents multiple subprocesses from loading the 10-13GB model simultaneously.
+    """
+    lock_path = _get_reindex_lock_path(project_path)
+    try:
+        lock_fd = open(lock_path, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except (IOError, OSError):
+        if lock_fd:
+            try:
+                lock_fd.close()
+            except Exception:
+                pass
+        return None
+
+
+def _release_reindex_lock(lock_fd):
+    """Release the cross-process reindex lock."""
+    if lock_fd:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
+        except Exception:
+            pass
 
 
 def _get_subprocess_detach_kwargs():
@@ -990,9 +1028,18 @@ Semantic Search:
             from .semantic import build_semantic_index, semantic_search
 
             if args.action == "index":
-                respect_ignore = not getattr(args, 'no_ignore', False)
-                count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
-                print(f"Indexed {count} code units")
+                # Acquire cross-process lock to prevent multiple model loads
+                lock_fd = _acquire_reindex_lock(args.path)
+                if not lock_fd:
+                    print("Reindex already in progress (another process holds the lock). Skipping.", file=sys.stderr)
+                    return 1
+
+                try:
+                    respect_ignore = not getattr(args, 'no_ignore', False)
+                    count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
+                    print(f"Indexed {count} code units")
+                finally:
+                    _release_reindex_lock(lock_fd)
 
             elif args.action == "search":
                 results = semantic_search(

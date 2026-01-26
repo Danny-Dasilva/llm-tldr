@@ -5,6 +5,8 @@ Holds indexes in memory and handles commands via Unix/TCP socket.
 """
 
 import atexit
+import fcntl
+import gc
 import hashlib
 import json
 import logging
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,6 +51,74 @@ from .cached_queries import (
 IDLE_TIMEOUT = 30 * 60
 
 logger = logging.getLogger(__name__)
+
+# Memory profiling
+MEMORY_LOG_PATH = "/tmp/tldr-memory-profile.log"
+MEMORY_WARNING_THRESHOLD_GB = 5.0
+
+
+def _log_memory_snapshot(label: str, log_path: str = MEMORY_LOG_PATH):
+    """Log memory snapshot with RSS, top allocations, and object counts."""
+    try:
+        import datetime
+
+        with open(log_path, "a") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"[{datetime.datetime.now().isoformat()}] {label}\n")
+            f.write(f"{'='*80}\n")
+
+            # 1. RSS memory from /proc/self/status
+            try:
+                with open("/proc/self/status") as status:
+                    for line in status:
+                        if line.startswith("VmRSS:"):
+                            rss_kb = int(line.split()[1])
+                            rss_gb = rss_kb / (1024 * 1024)
+                            f.write(f"RSS Memory: {rss_gb:.2f} GB ({rss_kb} KB)\n")
+                            break
+            except Exception as e:
+                f.write(f"Failed to read RSS: {e}\n")
+
+            # 2. Top 10 allocations by tracemalloc
+            if tracemalloc.is_tracing():
+                snapshot = tracemalloc.take_snapshot()
+                top_stats = snapshot.statistics("lineno")
+                f.write(f"\nTop 10 Memory Allocations:\n")
+                for i, stat in enumerate(top_stats[:10], 1):
+                    size_mb = stat.size / (1024 * 1024)
+                    f.write(f"  {i}. {stat.traceback.format()[0]}: {size_mb:.2f} MB\n")
+            else:
+                f.write("\nTracemalloc not active\n")
+
+            # 3. Object counts by type
+            objects = gc.get_objects()
+            type_counts = {}
+            for obj in objects:
+                obj_type = type(obj).__name__
+                type_counts[obj_type] = type_counts.get(obj_type, 0) + 1
+
+            f.write(f"\nTop 10 Object Types (total objects: {len(objects)}):\n")
+            sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+            for i, (obj_type, count) in enumerate(sorted_types[:10], 1):
+                f.write(f"  {i}. {obj_type}: {count}\n")
+
+            f.write("\n")
+
+    except Exception as e:
+        logger.exception(f"Failed to log memory snapshot: {e}")
+
+
+def _get_rss_gb() -> float:
+    """Get current RSS memory in GB."""
+    try:
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    return rss_kb / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
 
 
 class TLDRDaemon:
@@ -86,7 +157,8 @@ class TLDRDaemon:
         self._dirty_count: int = 0
         self._dirty_files: set[str] = set()
         self._reindex_in_progress: bool = False
-        self._reindex_lock = threading.Lock()  # Fix 1: Mutex for background reindex
+        self._reindex_lock = threading.Lock()  # Thread-level lock (secondary)
+        self._reindex_lock_fd: Optional[Any] = None  # File descriptor for cross-process lock
         self._semantic_config = self._load_semantic_config()
 
         # P7 Features: Per-session token stats tracking
@@ -99,6 +171,10 @@ class TLDRDaemon:
         self._hook_stats_baseline: dict[str, HookStats] = self._snapshot_hook_stats()
         self._hook_invocation_count: int = 0
         self._hook_flush_threshold: int = 5  # Flush every N invocations
+
+        # Memory profiling
+        tracemalloc.start()
+        _log_memory_snapshot("Daemon startup")
 
         # Cross-platform graceful shutdown: register atexit handler
         # This ensures stats persist even if daemon is killed (works on all platforms)
@@ -792,9 +868,15 @@ class TLDRDaemon:
         Returns:
             Response with dirty count and reindex status
         """
+        # Memory profiling: before processing
+        _log_memory_snapshot("Before _handle_notify")
+
         file_path = command.get("file")
         if not file_path:
             return {"status": "error", "message": "Missing required parameter: file"}
+
+        # Log what file is being notified (even if ignored later)
+        logger.info(f"Notify received: {file_path}")
 
         # Fix 2: Check .tldrignore EARLY before any processing
         # This prevents cascade of expensive operations for binary files
@@ -834,6 +916,15 @@ class TLDRDaemon:
         if should_reindex:
             self._trigger_background_reindex()
 
+        # Memory profiling: after processing
+        _log_memory_snapshot("After _handle_notify")
+
+        # Check if memory exceeds warning threshold
+        rss_gb = _get_rss_gb()
+        if rss_gb > MEMORY_WARNING_THRESHOLD_GB:
+            logger.warning(f"Memory usage high: {rss_gb:.2f} GB (threshold: {MEMORY_WARNING_THRESHOLD_GB} GB)")
+            _log_memory_snapshot(f"Memory warning: {rss_gb:.2f} GB")
+
         return {
             "status": "ok",
             "dirty_count": self._dirty_count,
@@ -841,66 +932,120 @@ class TLDRDaemon:
             "reindex_triggered": should_reindex,
         }
 
+    def _get_reindex_lock_path(self) -> str:
+        """Get project-specific reindex lock file path."""
+        project_hash = hashlib.md5(str(self.project).encode()).hexdigest()[:8]
+        return f"/tmp/tldr-reindex-{project_hash}.lock"
+
+    def _acquire_reindex_lock(self) -> bool:
+        """Try to acquire cross-process reindex lock. Returns True if acquired."""
+        try:
+            lock_path = self._get_reindex_lock_path()
+            self._reindex_lock_fd = open(lock_path, 'w')
+            fcntl.flock(self._reindex_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            logger.debug(f"Acquired reindex lock: {lock_path}")
+            return True
+        except (IOError, OSError) as e:
+            logger.debug(f"Could not acquire reindex lock: {e}")
+            if self._reindex_lock_fd:
+                try:
+                    self._reindex_lock_fd.close()
+                except Exception:
+                    pass
+                self._reindex_lock_fd = None
+            return False
+
+    def _release_reindex_lock(self):
+        """Release the cross-process reindex lock."""
+        if self._reindex_lock_fd:
+            try:
+                fcntl.flock(self._reindex_lock_fd, fcntl.LOCK_UN)
+                self._reindex_lock_fd.close()
+                logger.debug("Released reindex lock")
+            except Exception as e:
+                logger.debug(f"Error releasing reindex lock: {e}")
+            finally:
+                self._reindex_lock_fd = None
+
     def _trigger_background_reindex(self):
         """Trigger background semantic re-indexing.
 
         Spawns a subprocess to rebuild the semantic index,
         allowing the daemon to continue serving requests.
 
-        Uses a threading lock to ensure only one reindex runs at a time,
-        even when multiple notifications flood in rapidly (Fix 1).
+        Uses a file-based lock to ensure only one reindex runs at a time
+        across multiple processes, preventing multiple 10-13GB model loads.
         """
-        # Use lock to prevent race conditions between multiple threads
-        # checking _reindex_in_progress at the same time
-        if not self._reindex_lock.acquire(blocking=False):
-            # Another thread is already in the critical section
-            logger.debug("Reindex lock held by another thread, skipping")
+        # Memory profiling: before reindex
+        _log_memory_snapshot("Before _trigger_background_reindex")
+
+        # Try to acquire cross-process file lock
+        if not self._acquire_reindex_lock():
+            logger.info("Reindex already in progress (cross-process lock held), skipping")
             return
 
         try:
-            if self._reindex_in_progress:
-                logger.info("Re-index already in progress, skipping")
+            # Double-check with threading lock for same-process threads
+            if not self._reindex_lock.acquire(blocking=False):
+                logger.debug("Reindex lock held by another thread, skipping")
                 return
 
-            self._reindex_in_progress = True
-            dirty_files = list(self._dirty_files)
-            logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
-        finally:
-            self._reindex_lock.release()
-
-        def do_reindex():
             try:
-                import subprocess
+                if self._reindex_in_progress:
+                    logger.info("Re-index already in progress, skipping")
+                    return
 
-                # Run semantic index command
-                cmd = [
-                    sys.executable, "-m", "tldr.cli",
-                    "semantic", "index", str(self.project)
-                ]
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,  # 10 min max
-                )
-
-                if result.returncode == 0:
-                    logger.info("Background semantic re-index completed successfully")
-                else:
-                    logger.error(f"Background semantic re-index failed: {result.stderr}")
-
-            except Exception as e:
-                logger.exception(f"Background semantic re-index error: {e}")
+                self._reindex_in_progress = True
+                dirty_files = list(self._dirty_files)
+                logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
             finally:
-                # Reset dirty tracking (atomic with lock)
-                with self._reindex_lock:
-                    self._dirty_files.clear()
-                    self._dirty_count = 0
-                    self._reindex_in_progress = False
+                self._reindex_lock.release()
 
-        # Run in thread to not block daemon
-        thread = threading.Thread(target=do_reindex, daemon=True)
-        thread.start()
+            def do_reindex():
+                try:
+                    import subprocess
+
+                    # Run semantic index command
+                    cmd = [
+                        sys.executable, "-m", "tldr.cli",
+                        "semantic", "index", str(self.project)
+                    ]
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,  # 10 min max
+                    )
+
+                    if result.returncode == 0:
+                        logger.info("Background semantic re-index completed successfully")
+                    else:
+                        logger.error(f"Background semantic re-index failed: {result.stderr}")
+
+                except Exception as e:
+                    logger.exception(f"Background semantic re-index error: {e}")
+                finally:
+                    # Reset dirty tracking (atomic with lock)
+                    with self._reindex_lock:
+                        self._dirty_files.clear()
+                        self._dirty_count = 0
+                        self._reindex_in_progress = False
+
+                    # Release cross-process lock AFTER subprocess completes
+                    self._release_reindex_lock()
+
+                    # Memory profiling: after reindex
+                    _log_memory_snapshot("After _trigger_background_reindex completed")
+
+            # Run in thread to not block daemon
+            thread = threading.Thread(target=do_reindex, daemon=True)
+            thread.start()
+
+        except Exception as e:
+            # If we fail to start the thread, release the lock immediately
+            logger.exception(f"Failed to start reindex thread: {e}")
+            self._release_reindex_lock()
+            raise
 
     def _handle_diagnostics(self, command: dict) -> dict:
         """Handle diagnostics command - type check + lint.
