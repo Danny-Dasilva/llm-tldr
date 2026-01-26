@@ -497,6 +497,10 @@ Semantic Search:
     stats_p.add_argument(
         "--json", action="store_true", help="Output as JSON instead of table"
     )
+    stats_p.add_argument(
+        "--cumulative", action="store_true",
+        help="Show cumulative token savings across all sessions (stored in ~/.tldr/stats/)"
+    )
 
     args = parser.parse_args()
 
@@ -646,6 +650,41 @@ Semantic Search:
             return langs[0] if langs else "python"
         return lang_arg
 
+    def _track_usage(command: str, project: str, output: str, files: list[Path] | None = None):
+        """Track token usage for a command.
+
+        Args:
+            command: The tldr command name
+            project: Project path
+            output: The JSON output string
+            files: Optional list of files (for raw token estimation)
+        """
+        try:
+            from .tracking import record_usage
+            from .stats import count_tokens
+
+            # Count TLDR output tokens
+            tldr_tokens = count_tokens(output)
+
+            # Estimate raw tokens from files if provided
+            raw_tokens = 0
+            if files:
+                for f in files[:50]:  # Limit to 50 files for performance
+                    try:
+                        if f.exists():
+                            raw_tokens += len(f.read_text(errors="ignore")) // 4  # ~4 chars per token
+                    except Exception:
+                        pass
+
+            # If no files provided, estimate based on output size
+            if raw_tokens == 0 and tldr_tokens > 0:
+                # Typical savings is ~90%, so raw is ~10x tldr
+                raw_tokens = tldr_tokens * 10
+
+            record_usage(command, project, raw_tokens, tldr_tokens)
+        except Exception:
+            pass  # Don't let tracking errors break commands
+
     try:
         if args.command == "tree":
             ext = set(args.ext) if args.ext else None
@@ -654,7 +693,9 @@ Semantic Search:
                 args.path, extensions=ext, exclude_hidden=not args.show_hidden,
                 ignore_spec=ignore_spec
             )
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("tree", str(Path(args.path).resolve()), output)
 
         elif args.command == "structure":
             ignore_spec = get_ignore_spec(args.path)
@@ -696,7 +737,11 @@ Semantic Search:
                 "languages": languages,
                 "files": all_files[:args.max],  # Respect max across all languages
             }
-            print(json.dumps(combined_result, indent=2))
+            output = json.dumps(combined_result, indent=2)
+            print(output)
+            # Get files for raw token estimation
+            structure_files = [project_path / f.get("path", "") for f in all_files if f.get("path")]
+            _track_usage("structure", str(project_path), output, structure_files)
 
         elif args.command == "search":
             ext = set(args.ext) if args.ext else None
@@ -764,7 +809,9 @@ Semantic Search:
                 args.project, args.entry, depth=args.depth, language=args.lang
             )
             # Output LLM-ready string directly
-            print(ctx.to_llm_string())
+            output = ctx.to_llm_string()
+            print(output)
+            _track_usage("context", str(Path(args.project).resolve()), output)
 
         elif args.command == "cfg":
             lang = args.lang or detect_language_from_extension(args.file)
@@ -805,7 +852,9 @@ Semantic Search:
                 ],
                 "count": len(graph.edges),
             }
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("calls", str(Path(args.path).resolve()), output)
 
         elif args.command == "impact":
             # Support both positional path and --project flag
@@ -818,7 +867,9 @@ Semantic Search:
                 target_file=args.file,
                 language=lang,
             )
-            print(json.dumps(result, indent=2))
+            output = json.dumps(result, indent=2)
+            print(output)
+            _track_usage("impact", str(Path(project_root).resolve()), output)
 
         elif args.command == "dead":
             lang = resolve_language(args.lang, args.path)
@@ -1284,6 +1335,24 @@ Semantic Search:
 
         elif args.command == "stats":
             from .stats import count_tokens
+
+            # Handle --cumulative flag
+            if getattr(args, 'cumulative', False):
+                from .tracking import UsageTracker
+                tracker = UsageTracker()
+
+                if args.json:
+                    cumulative = tracker.get_cumulative_stats()
+                    by_command = tracker.get_stats_by_command()
+                    by_project = tracker.get_stats_by_project()
+                    print(json.dumps({
+                        "cumulative": cumulative,
+                        "by_command": by_command,
+                        "by_project": by_project,
+                    }, indent=2))
+                else:
+                    print(tracker.format_cumulative_report())
+                sys.exit(0)
 
             project_path = Path(args.path).resolve()
             lang = args.lang
