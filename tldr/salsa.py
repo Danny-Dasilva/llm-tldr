@@ -113,9 +113,15 @@ class SalsaDB:
     - Reverse dependency graph for invalidation cascading
 
     Thread-safe for concurrent access.
+
+    Args:
+        max_cache_size: Maximum number of cache entries before LRU eviction (default 10000)
     """
 
-    def __init__(self):
+    # Default max cache size (can be overridden per-instance)
+    DEFAULT_MAX_CACHE_SIZE = 10000
+
+    def __init__(self, max_cache_size: int = DEFAULT_MAX_CACHE_SIZE):
         self._lock = threading.RLock()
 
         # File storage
@@ -124,6 +130,10 @@ class SalsaDB:
 
         # Query cache: (func, args) -> CacheEntry
         self._query_cache: Dict[QueryKey, CacheEntry] = {}
+
+        # LRU tracking: ordered list of keys from oldest to newest access
+        self._max_cache_size = max_cache_size
+        self._lru_order: List[QueryKey] = []
 
         # Reverse dependencies: query_key -> set of dependent query_keys
         self._reverse_deps: Dict[QueryKey, Set[QueryKey]] = {}
@@ -136,6 +146,37 @@ class SalsaDB:
 
         # Active query stack for dependency tracking
         self._query_stack: List[QueryKey] = []
+
+    def _touch_lru(self, key: QueryKey) -> None:
+        """Move a key to the end of the LRU list (most recently used)."""
+        # Remove if exists
+        if key in self._lru_order:
+            self._lru_order.remove(key)
+        # Add to end (most recently used)
+        self._lru_order.append(key)
+
+    def _evict_lru_if_needed(self) -> None:
+        """Evict oldest entries if cache exceeds max size."""
+        while len(self._query_cache) > self._max_cache_size and self._lru_order:
+            # Get oldest key
+            oldest_key = self._lru_order.pop(0)
+            if oldest_key in self._query_cache:
+                # Clean up all related tracking
+                self._remove_cache_entry(oldest_key)
+
+    def _remove_cache_entry(self, key: QueryKey) -> None:
+        """Remove a cache entry and clean up related tracking."""
+        if key in self._query_cache:
+            del self._query_cache[key]
+            self._stats.invalidations += 1
+
+        # Clean up reverse deps
+        if key in self._reverse_deps:
+            del self._reverse_deps[key]
+
+        # Clean up file_to_queries references
+        for file_path in list(self._file_to_queries.keys()):
+            self._file_to_queries[file_path].discard(key)
 
     # -------------------------------------------------------------------------
     # File Management
@@ -222,6 +263,8 @@ class SalsaDB:
                 entry = self._query_cache[key]
                 if self._is_entry_valid(entry):
                     self._stats.cache_hits += 1
+                    # Update LRU tracking on cache hit
+                    self._touch_lru(key)
                     # Still register dependency to parent even on cache hit
                     self._register_dependency_to_parent(key)
                     return entry.result
@@ -261,6 +304,10 @@ class SalsaDB:
                         )
 
                 self._query_cache[key] = entry
+
+                # Update LRU tracking and evict if needed
+                self._touch_lru(key)
+                self._evict_lru_if_needed()
 
                 return result
 

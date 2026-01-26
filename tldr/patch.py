@@ -55,11 +55,15 @@ class Edge:
         return (self.from_file, self.from_func, self.to_file, self.to_func)
 
 
-def compute_file_hash(file_path: str) -> str:
-    """Compute SHA-1 hash of file content.
+def compute_file_hash(file_path: str, chunk_size: int = 65536) -> str:
+    """Compute SHA-1 hash of file content using streaming/chunked reads.
+
+    This implementation reads files in chunks to avoid loading large files
+    (e.g., 200MB+ binaries) entirely into memory.
 
     Args:
         file_path: Absolute path to the file
+        chunk_size: Size of chunks to read (default 64KB)
 
     Returns:
         40-character hex string representing the SHA-1 hash
@@ -67,9 +71,11 @@ def compute_file_hash(file_path: str) -> str:
     Raises:
         FileNotFoundError: If the file doesn't exist
     """
-    path = Path(file_path)
-    content = path.read_bytes()
-    return hashlib.sha1(content).hexdigest()
+    h = hashlib.sha1()
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(chunk_size):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def has_file_changed(file_path: str, cached_hash: str) -> bool:

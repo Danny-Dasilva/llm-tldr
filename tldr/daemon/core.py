@@ -13,6 +13,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -85,6 +86,7 @@ class TLDRDaemon:
         self._dirty_count: int = 0
         self._dirty_files: set[str] = set()
         self._reindex_in_progress: bool = False
+        self._reindex_lock = threading.Lock()  # Fix 1: Mutex for background reindex
         self._semantic_config = self._load_semantic_config()
 
         # P7 Features: Per-session token stats tracking
@@ -781,6 +783,9 @@ class TLDRDaemon:
         Tracks dirty files and triggers background semantic re-indexing
         when threshold is reached.
 
+        Fix 2: Checks .tldrignore EARLY to prevent processing binary files
+        (.whl, .so, etc.) that should be excluded.
+
         Args:
             command: Dict with 'file' (path to changed file)
 
@@ -790,6 +795,19 @@ class TLDRDaemon:
         file_path = command.get("file")
         if not file_path:
             return {"status": "error", "message": "Missing required parameter: file"}
+
+        # Fix 2: Check .tldrignore EARLY before any processing
+        # This prevents cascade of expensive operations for binary files
+        from tldr.tldrignore import should_ignore, load_ignore_patterns
+
+        try:
+            spec = load_ignore_patterns(self.project)
+            if should_ignore(file_path, self.project, spec):
+                logger.debug(f"Ignoring file per .tldrignore: {file_path}")
+                return {"status": "ignored", "file": file_path, "ignored": True}
+        except Exception as e:
+            # If ignore check fails, continue with processing
+            logger.warning(f"Failed to check .tldrignore for {file_path}: {e}")
 
         # Check if semantic search is enabled
         if not self._semantic_config.get("enabled", True):
@@ -828,14 +846,27 @@ class TLDRDaemon:
 
         Spawns a subprocess to rebuild the semantic index,
         allowing the daemon to continue serving requests.
+
+        Uses a threading lock to ensure only one reindex runs at a time,
+        even when multiple notifications flood in rapidly (Fix 1).
         """
-        if self._reindex_in_progress:
-            logger.info("Re-index already in progress, skipping")
+        # Use lock to prevent race conditions between multiple threads
+        # checking _reindex_in_progress at the same time
+        if not self._reindex_lock.acquire(blocking=False):
+            # Another thread is already in the critical section
+            logger.debug("Reindex lock held by another thread, skipping")
             return
 
-        self._reindex_in_progress = True
-        dirty_files = list(self._dirty_files)
-        logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
+        try:
+            if self._reindex_in_progress:
+                logger.info("Re-index already in progress, skipping")
+                return
+
+            self._reindex_in_progress = True
+            dirty_files = list(self._dirty_files)
+            logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
+        finally:
+            self._reindex_lock.release()
 
         def do_reindex():
             try:
@@ -861,13 +892,13 @@ class TLDRDaemon:
             except Exception as e:
                 logger.exception(f"Background semantic re-index error: {e}")
             finally:
-                # Reset dirty tracking
-                self._dirty_files.clear()
-                self._dirty_count = 0
-                self._reindex_in_progress = False
+                # Reset dirty tracking (atomic with lock)
+                with self._reindex_lock:
+                    self._dirty_files.clear()
+                    self._dirty_count = 0
+                    self._reindex_in_progress = False
 
         # Run in thread to not block daemon
-        import threading
         thread = threading.Thread(target=do_reindex, daemon=True)
         thread.start()
 
