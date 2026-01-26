@@ -31,6 +31,7 @@ from tldr.stats import (
     count_tokens,
     get_default_store,
 )
+from tldr.tracking import UsageTracker
 
 from .cached_queries import (
     cached_architecture,
@@ -171,6 +172,9 @@ class TLDRDaemon:
         self._hook_stats_baseline: dict[str, HookStats] = self._snapshot_hook_stats()
         self._hook_invocation_count: int = 0
         self._hook_flush_threshold: int = 5  # Flush every N invocations
+
+        # Usage tracking for daemon commands
+        self._tracker = UsageTracker()
 
         # Memory profiling
         tracemalloc.start()
@@ -464,13 +468,26 @@ class TLDRDaemon:
         try:
             max_results = command.get("max_results", 100)
             # Use SalsaDB for cached search
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_search,
                 self.salsa_db,
                 str(self.project),
                 pattern,
                 max_results,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 10  # Estimate: search results are compressed ~10x
+            tldr_tokens = len(output) // 4  # Rough token estimate
+            self._tracker.record_usage(
+                command="search",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Search failed")
             return {"status": "error", "message": str(e)}
@@ -537,7 +554,20 @@ class TLDRDaemon:
                         "line": edge.get("line"),
                     })
 
-            return {"status": "ok", "callers": callers}
+            result = {"status": "ok", "callers": callers}
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 5  # Estimate: impact is moderately compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="impact",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Impact analysis failed")
             return {"status": "error", "message": str(e)}
@@ -566,13 +596,26 @@ class TLDRDaemon:
             entry_points = command.get("entry_points")
             # Convert to tuple for hashability (SalsaDB cache key)
             entry_tuple = tuple(entry_points) if entry_points else ()
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_dead_code,
                 self.salsa_db,
                 str(self.project),
                 entry_tuple,
                 language,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 8  # Estimate: dead code analysis is highly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="dead",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Dead code analysis failed")
             return {"status": "error", "message": str(e)}
@@ -581,12 +624,25 @@ class TLDRDaemon:
         """Handle architecture analysis command."""
         try:
             language = command.get("language", "python")
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_architecture,
                 self.salsa_db,
                 str(self.project),
                 language,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 8  # Estimate: arch analysis is highly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="arch",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Architecture analysis failed")
             return {"status": "error", "message": str(e)}
@@ -600,13 +656,26 @@ class TLDRDaemon:
 
         try:
             language = command.get("language", "python")
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_cfg,
                 self.salsa_db,
                 file_path,
                 function,
                 language,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 6  # Estimate: CFG is moderately compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="cfg",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("CFG extraction failed")
             return {"status": "error", "message": str(e)}
@@ -620,13 +689,26 @@ class TLDRDaemon:
 
         try:
             language = command.get("language", "python")
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_dfg,
                 self.salsa_db,
                 file_path,
                 function,
                 language,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 6  # Estimate: DFG is moderately compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="dfg",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("DFG extraction failed")
             return {"status": "error", "message": str(e)}
@@ -642,7 +724,7 @@ class TLDRDaemon:
         try:
             direction = command.get("direction", "backward")
             variable = command.get("variable", "")
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_slice,
                 self.salsa_db,
                 file_path,
@@ -651,6 +733,19 @@ class TLDRDaemon:
                 direction,
                 variable,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 7  # Estimate: slices are fairly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="slice",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Program slice failed")
             return {"status": "error", "message": str(e)}
@@ -668,7 +763,20 @@ class TLDRDaemon:
                 ],
                 "count": len(graph.edges),
             }
-            return {"status": "ok", "result": result}
+            response = {"status": "ok", "result": result}
+
+            # Track usage
+            output = json.dumps(response)
+            raw_tokens = len(output) * 12  # Estimate: call graphs are highly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="calls",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return response
         except Exception as e:
             logger.exception("Call graph building failed")
             return {"status": "error", "message": str(e)}
@@ -722,7 +830,20 @@ class TLDRDaemon:
                     return {"status": "error", "message": "Missing required parameter: query"}
                 k = command.get("k", 10)
                 results = semantic_search(str(self.project), query, k=k)
-                return {"status": "ok", "results": results}
+                result = {"status": "ok", "results": results}
+
+                # Track usage for search action
+                output = json.dumps(result)
+                raw_tokens = len(output) * 15  # Estimate: semantic search is very compressed
+                tldr_tokens = len(output) // 4
+                self._tracker.record_usage(
+                    command="semantic",
+                    project=str(self.project),
+                    raw_tokens=raw_tokens,
+                    tldr_tokens=tldr_tokens
+                )
+
+                return result
 
             else:
                 return {"status": "error", "message": f"Unknown action: {action}"}
@@ -737,13 +858,26 @@ class TLDRDaemon:
             extensions = command.get("extensions")
             ext_tuple = tuple(extensions) if extensions else ()
             exclude_hidden = command.get("exclude_hidden", True)
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_tree,
                 self.salsa_db,
                 str(self.project),
                 ext_tuple,
                 exclude_hidden,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 15  # Estimate: tree is highly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="tree",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("File tree failed")
             return {"status": "error", "message": str(e)}
@@ -753,13 +887,26 @@ class TLDRDaemon:
         try:
             language = command.get("language", "python")
             max_results = command.get("max_results", 100)
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_structure,
                 self.salsa_db,
                 str(self.project),
                 language,
                 max_results,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 20  # Estimate: structure is very highly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="structure",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Code structure failed")
             return {"status": "error", "message": str(e)}
@@ -773,7 +920,7 @@ class TLDRDaemon:
         try:
             language = command.get("language", "python")
             depth = command.get("depth", 2)
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_context,
                 self.salsa_db,
                 str(self.project),
@@ -781,6 +928,19 @@ class TLDRDaemon:
                 language,
                 depth,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 12  # Estimate: context is highly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="context",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Relevant context failed")
             return {"status": "error", "message": str(e)}
@@ -793,12 +953,25 @@ class TLDRDaemon:
 
         try:
             language = command.get("language", "python")
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_imports,
                 self.salsa_db,
                 file_path,
                 language,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 8  # Estimate: imports are moderately compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="imports",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Imports extraction failed")
             return {"status": "error", "message": str(e)}
@@ -811,13 +984,26 @@ class TLDRDaemon:
 
         try:
             language = command.get("language", "python")
-            return self.salsa_db.query(
+            result = self.salsa_db.query(
                 cached_importers,
                 self.salsa_db,
                 str(self.project),
                 module,
                 language,
             )
+
+            # Track usage
+            output = json.dumps(result)
+            raw_tokens = len(output) * 10  # Estimate: importers are fairly compressed
+            tldr_tokens = len(output) // 4
+            self._tracker.record_usage(
+                command="importers",
+                project=str(self.project),
+                raw_tokens=raw_tokens,
+                tldr_tokens=tldr_tokens
+            )
+
+            return result
         except Exception as e:
             logger.exception("Importers lookup failed")
             return {"status": "error", "message": str(e)}
