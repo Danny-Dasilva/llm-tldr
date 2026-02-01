@@ -21,6 +21,7 @@ import tracemalloc
 from pathlib import Path
 from typing import Any, Optional
 
+from tldr.cross_file_calls import _parse_imports_cached, _scan_project_cached
 from tldr.dedup import ContentHashedIndex
 from tldr.salsa import SalsaDB
 from tldr.stats import (
@@ -56,6 +57,7 @@ logger = logging.getLogger(__name__)
 # Memory profiling
 MEMORY_LOG_PATH = "/tmp/tldr-memory-profile.log"
 MEMORY_WARNING_THRESHOLD_GB = 5.0
+MEMORY_CLEANUP_THRESHOLD_GB = 3.0
 
 
 def _log_memory_snapshot(label: str, log_path: str = MEMORY_LOG_PATH):
@@ -190,6 +192,23 @@ class TLDRDaemon:
         hash_val = hashlib.md5(str(Path(self.project).resolve()).encode()).hexdigest()[:8]
         tmp_dir = tempfile.gettempdir()
         return Path(tmp_dir) / f"tldr-{hash_val}.sock"
+
+    def _check_memory_pressure(self) -> None:
+        """Check RSS and perform cleanup if memory exceeds cleanup threshold."""
+        rss_gb = _get_rss_gb()
+        if rss_gb > MEMORY_CLEANUP_THRESHOLD_GB:
+            logger.warning(
+                f"Memory pressure: {rss_gb:.2f} GB exceeds cleanup threshold "
+                f"({MEMORY_CLEANUP_THRESHOLD_GB} GB). Clearing caches..."
+            )
+            _scan_project_cached.cache_clear()
+            _parse_imports_cached.cache_clear()
+            gc.collect()
+            new_rss_gb = _get_rss_gb()
+            logger.warning(
+                f"Memory after cleanup: {new_rss_gb:.2f} GB "
+                f"(freed {rss_gb - new_rss_gb:.2f} GB)"
+            )
 
     def _load_semantic_config(self) -> dict:
         """Load semantic search configuration.
@@ -1110,6 +1129,9 @@ class TLDRDaemon:
         if rss_gb > MEMORY_WARNING_THRESHOLD_GB:
             logger.warning(f"Memory usage high: {rss_gb:.2f} GB (threshold: {MEMORY_WARNING_THRESHOLD_GB} GB)")
             _log_memory_snapshot(f"Memory warning: {rss_gb:.2f} GB")
+
+        # Reactive cleanup when memory exceeds cleanup threshold
+        self._check_memory_pressure()
 
         return {
             "status": "ok",

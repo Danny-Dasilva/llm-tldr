@@ -16,10 +16,11 @@ Key functions:
 
 import ast
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from tldr.workspace import WorkspaceConfig, load_workspace_config, filter_paths
 
@@ -155,176 +156,152 @@ class ProjectCallGraph:
         return edge in self._edges
 
 
-# Module-level parser cache for performance (parsers are expensive to create)
-_parser_cache: dict[str, object] = {}
+# Module-level parser cache for performance (parsers are expensive to create).
+# Uses OrderedDict as an LRU cache to bound memory: most sessions use 1-3 languages,
+# so capping at 5 prevents unbounded growth from 17 possible tree-sitter parsers
+# (each holding 10-50MB of native memory).
+MAX_PARSER_CACHE_SIZE: int = 5
+_parser_cache: OrderedDict[str, object] = OrderedDict()
+
+
+def _cached_parser(key: str, factory: Callable[[], object]) -> object:
+    """Get a parser from cache or create via factory, with LRU eviction.
+
+    Moves accessed entries to end (most-recently-used). Evicts oldest
+    entries when cache exceeds MAX_PARSER_CACHE_SIZE.
+    """
+    if key in _parser_cache:
+        _parser_cache.move_to_end(key)
+        return _parser_cache[key]
+
+    parser = factory()
+    _parser_cache[key] = parser
+
+    # Evict oldest entries if over limit
+    while len(_parser_cache) > MAX_PARSER_CACHE_SIZE:
+        _parser_cache.popitem(last=False)
+
+    return parser
 
 
 def _get_ts_parser():
     """Get or create a tree-sitter TypeScript parser."""
-    if "typescript" in _parser_cache:
-        return _parser_cache["typescript"]
-
-    if not TREE_SITTER_AVAILABLE:
-        raise RuntimeError("tree-sitter-typescript not available")
-
-    ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
-    parser = tree_sitter.Parser(ts_lang)
-    _parser_cache["typescript"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_AVAILABLE:
+            raise RuntimeError("tree-sitter-typescript not available")
+        ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
+        return tree_sitter.Parser(ts_lang)
+    return _cached_parser("typescript", _create)
 
 
 def _get_rust_parser():
     """Get or create a tree-sitter Rust parser."""
-    if "rust" in _parser_cache:
-        return _parser_cache["rust"]
-
-    if not TREE_SITTER_RUST_AVAILABLE:
-        raise RuntimeError("tree-sitter-rust not available")
-
-    rust_lang = tree_sitter.Language(tree_sitter_rust.language())
-    parser = tree_sitter.Parser(rust_lang)
-    _parser_cache["rust"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_RUST_AVAILABLE:
+            raise RuntimeError("tree-sitter-rust not available")
+        rust_lang = tree_sitter.Language(tree_sitter_rust.language())
+        return tree_sitter.Parser(rust_lang)
+    return _cached_parser("rust", _create)
 
 
 def _get_go_parser():
     """Get or create a tree-sitter Go parser."""
-    if "go" in _parser_cache:
-        return _parser_cache["go"]
-
-    if not TREE_SITTER_GO_AVAILABLE:
-        raise RuntimeError("tree-sitter-go not available")
-
-    go_lang = tree_sitter.Language(tree_sitter_go.language())
-    parser = tree_sitter.Parser(go_lang)
-    _parser_cache["go"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_GO_AVAILABLE:
+            raise RuntimeError("tree-sitter-go not available")
+        go_lang = tree_sitter.Language(tree_sitter_go.language())
+        return tree_sitter.Parser(go_lang)
+    return _cached_parser("go", _create)
 
 
 def _get_java_parser():
     """Get or create a tree-sitter Java parser."""
-    if "java" in _parser_cache:
-        return _parser_cache["java"]
-
-    if not TREE_SITTER_JAVA_AVAILABLE:
-        raise RuntimeError("tree-sitter-java not available")
-
-    java_lang = tree_sitter.Language(tree_sitter_java.language())
-    parser = tree_sitter.Parser(java_lang)
-    _parser_cache["java"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_JAVA_AVAILABLE:
+            raise RuntimeError("tree-sitter-java not available")
+        java_lang = tree_sitter.Language(tree_sitter_java.language())
+        return tree_sitter.Parser(java_lang)
+    return _cached_parser("java", _create)
 
 
 def _get_c_parser():
     """Get or create a tree-sitter C parser."""
-    if "c" in _parser_cache:
-        return _parser_cache["c"]
-
-    if not TREE_SITTER_C_AVAILABLE:
-        raise RuntimeError("tree-sitter-c not available")
-
-    c_lang = tree_sitter.Language(tree_sitter_c.language())
-    parser = tree_sitter.Parser(c_lang)
-    _parser_cache["c"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_C_AVAILABLE:
+            raise RuntimeError("tree-sitter-c not available")
+        c_lang = tree_sitter.Language(tree_sitter_c.language())
+        return tree_sitter.Parser(c_lang)
+    return _cached_parser("c", _create)
 
 
 def _get_ruby_parser():
     """Get or create a tree-sitter Ruby parser."""
-    if "ruby" in _parser_cache:
-        return _parser_cache["ruby"]
-
-    if not TREE_SITTER_RUBY_AVAILABLE:
-        raise RuntimeError("tree-sitter-ruby not available")
-
-    ruby_lang = tree_sitter.Language(tree_sitter_ruby.language())
-    parser = tree_sitter.Parser(ruby_lang)
-    _parser_cache["ruby"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_RUBY_AVAILABLE:
+            raise RuntimeError("tree-sitter-ruby not available")
+        ruby_lang = tree_sitter.Language(tree_sitter_ruby.language())
+        return tree_sitter.Parser(ruby_lang)
+    return _cached_parser("ruby", _create)
 
 
 def _get_php_parser():
     """Get or create a tree-sitter PHP parser."""
-    if "php" in _parser_cache:
-        return _parser_cache["php"]
-
-    if not TREE_SITTER_PHP_AVAILABLE:
-        raise RuntimeError("tree-sitter-php not available")
-
-    php_lang = tree_sitter.Language(tree_sitter_php.language_php())
-    parser = tree_sitter.Parser(php_lang)
-    _parser_cache["php"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_PHP_AVAILABLE:
+            raise RuntimeError("tree-sitter-php not available")
+        php_lang = tree_sitter.Language(tree_sitter_php.language_php())
+        return tree_sitter.Parser(php_lang)
+    return _cached_parser("php", _create)
 
 
 def _get_cpp_parser():
     """Get or create a tree-sitter C++ parser."""
-    if "cpp" in _parser_cache:
-        return _parser_cache["cpp"]
-
-    if not TREE_SITTER_CPP_AVAILABLE:
-        raise RuntimeError("tree-sitter-cpp not available")
-
-    cpp_lang = tree_sitter.Language(tree_sitter_cpp.language())
-    parser = tree_sitter.Parser(cpp_lang)
-    _parser_cache["cpp"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_CPP_AVAILABLE:
+            raise RuntimeError("tree-sitter-cpp not available")
+        cpp_lang = tree_sitter.Language(tree_sitter_cpp.language())
+        return tree_sitter.Parser(cpp_lang)
+    return _cached_parser("cpp", _create)
 
 
 def _get_kotlin_parser():
     """Get or create a tree-sitter Kotlin parser."""
-    if "kotlin" in _parser_cache:
-        return _parser_cache["kotlin"]
-
-    if not TREE_SITTER_KOTLIN_AVAILABLE:
-        raise RuntimeError("tree-sitter-kotlin not available")
-
-    kotlin_lang = tree_sitter.Language(tree_sitter_kotlin.language())
-    parser = tree_sitter.Parser(kotlin_lang)
-    _parser_cache["kotlin"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_KOTLIN_AVAILABLE:
+            raise RuntimeError("tree-sitter-kotlin not available")
+        kotlin_lang = tree_sitter.Language(tree_sitter_kotlin.language())
+        return tree_sitter.Parser(kotlin_lang)
+    return _cached_parser("kotlin", _create)
 
 
 def _get_swift_parser():
     """Get or create a tree-sitter Swift parser."""
-    if "swift" in _parser_cache:
-        return _parser_cache["swift"]
-
-    if not TREE_SITTER_SWIFT_AVAILABLE:
-        raise RuntimeError("tree-sitter-swift not available")
-
-    swift_lang = tree_sitter.Language(tree_sitter_swift.language())
-    parser = tree_sitter.Parser(swift_lang)
-    _parser_cache["swift"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_SWIFT_AVAILABLE:
+            raise RuntimeError("tree-sitter-swift not available")
+        swift_lang = tree_sitter.Language(tree_sitter_swift.language())
+        return tree_sitter.Parser(swift_lang)
+    return _cached_parser("swift", _create)
 
 
 def _get_csharp_parser():
     """Get or create a tree-sitter C# parser."""
-    if "csharp" in _parser_cache:
-        return _parser_cache["csharp"]
-
-    if not TREE_SITTER_CSHARP_AVAILABLE:
-        raise RuntimeError("tree-sitter-c-sharp not available")
-
-    csharp_lang = tree_sitter.Language(tree_sitter_c_sharp.language())
-    parser = tree_sitter.Parser(csharp_lang)
-    _parser_cache["csharp"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_CSHARP_AVAILABLE:
+            raise RuntimeError("tree-sitter-c-sharp not available")
+        csharp_lang = tree_sitter.Language(tree_sitter_c_sharp.language())
+        return tree_sitter.Parser(csharp_lang)
+    return _cached_parser("csharp", _create)
 
 
 def _get_scala_parser():
     """Get or create a tree-sitter Scala parser."""
-    if "scala" in _parser_cache:
-        return _parser_cache["scala"]
-
-    if not TREE_SITTER_SCALA_AVAILABLE:
-        raise RuntimeError("tree-sitter-scala not available")
-
-    scala_lang = tree_sitter.Language(tree_sitter_scala.language())
-    parser = tree_sitter.Parser(scala_lang)
-    _parser_cache["scala"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_SCALA_AVAILABLE:
+            raise RuntimeError("tree-sitter-scala not available")
+        scala_lang = tree_sitter.Language(tree_sitter_scala.language())
+        return tree_sitter.Parser(scala_lang)
+    return _cached_parser("scala", _create)
 
 
 @lru_cache(maxsize=128)
@@ -1285,16 +1262,12 @@ def _parse_ruby_require_node(node, source: bytes) -> dict | None:
 
 def _get_lua_parser():
     """Get or create a tree-sitter Lua parser."""
-    if "lua" in _parser_cache:
-        return _parser_cache["lua"]
-
-    if not TREE_SITTER_LUA_AVAILABLE:
-        raise RuntimeError("tree-sitter-lua not available")
-
-    lua_lang = tree_sitter.Language(tree_sitter_lua.language())
-    parser = tree_sitter.Parser(lua_lang)
-    _parser_cache["lua"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_LUA_AVAILABLE:
+            raise RuntimeError("tree-sitter-lua not available")
+        lua_lang = tree_sitter.Language(tree_sitter_lua.language())
+        return tree_sitter.Parser(lua_lang)
+    return _cached_parser("lua", _create)
 
 
 def parse_lua_imports(file_path: str | Path) -> list[dict]:
@@ -1413,16 +1386,12 @@ except ImportError:
 
 def _get_luau_parser():
     """Get or create a tree-sitter Luau parser."""
-    if "luau" in _parser_cache:
-        return _parser_cache["luau"]
-
-    if not TREE_SITTER_LUAU_AVAILABLE:
-        raise RuntimeError("tree-sitter-luau not available")
-
-    luau_lang = tree_sitter.Language(tree_sitter_luau.language())
-    parser = tree_sitter.Parser(luau_lang)
-    _parser_cache["luau"] = parser
-    return parser
+    def _create():
+        if not TREE_SITTER_LUAU_AVAILABLE:
+            raise RuntimeError("tree-sitter-luau not available")
+        luau_lang = tree_sitter.Language(tree_sitter_luau.language())
+        return tree_sitter.Parser(luau_lang)
+    return _cached_parser("luau", _create)
 
 
 def parse_luau_imports(file_path: str | Path) -> list[dict]:
@@ -1598,14 +1567,12 @@ def parse_elixir_imports(file_path: str | Path) -> list[dict]:
 
 def _get_elixir_parser():
     """Get or create an Elixir tree-sitter parser."""
-    if "elixir" in _parser_cache:
-        return _parser_cache["elixir"]
-
-    from tree_sitter import Language, Parser
-    parser = Parser()
-    parser.language = Language(tree_sitter_elixir.language())
-    _parser_cache["elixir"] = parser
-    return parser
+    def _create():
+        from tree_sitter import Language, Parser
+        parser = Parser()
+        parser.language = Language(tree_sitter_elixir.language())
+        return parser
+    return _cached_parser("elixir", _create)
 
 
 def _parse_elixir_import_node(node, source: bytes) -> dict | None:

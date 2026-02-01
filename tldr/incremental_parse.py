@@ -245,6 +245,8 @@ class TreeCache:
     on cache hit since tree-sitter Tree objects aren't directly serializable.
     """
 
+    MAX_MEMORY_CACHE_SIZE: int = 100
+
     def __init__(self, cache_dir: Optional[Path] = None):
         """Initialize the tree cache.
 
@@ -304,6 +306,11 @@ class TreeCache:
             tree: Parsed tree-sitter Tree
             source: Source content as bytes
         """
+        # Evict oldest entry if at capacity
+        if file_path not in self._memory_cache and len(self._memory_cache) >= self.MAX_MEMORY_CACHE_SIZE:
+            oldest_key = next(iter(self._memory_cache))
+            del self._memory_cache[oldest_key]
+
         # Store in memory
         self._memory_cache[file_path] = (tree, source)
 
@@ -325,6 +332,10 @@ class TreeCache:
                 f.write(source)
 
             self._save_index()
+
+    def clear(self) -> None:
+        """Clear the in-memory cache."""
+        self._memory_cache.clear()
 
     def _detect_language(self, file_path: str) -> str:
         """Detect language from file extension."""

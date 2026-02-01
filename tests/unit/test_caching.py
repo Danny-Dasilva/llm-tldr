@@ -101,6 +101,89 @@ class TestParseImportsCaching:
         assert info2.hits > info1.hits
 
 
+class TestParserCacheLRUEviction:
+    """Test that _parser_cache has bounded size with LRU eviction."""
+
+    def test_parser_cache_has_max_size_constant(self):
+        """Module should define MAX_PARSER_CACHE_SIZE."""
+        from tldr import cross_file_calls
+
+        assert hasattr(cross_file_calls, "MAX_PARSER_CACHE_SIZE")
+        assert cross_file_calls.MAX_PARSER_CACHE_SIZE == 5
+
+    def test_parser_cache_is_ordered_dict(self):
+        """_parser_cache should be an OrderedDict for LRU behavior."""
+        from collections import OrderedDict
+        from tldr import cross_file_calls
+
+        assert isinstance(cross_file_calls._parser_cache, OrderedDict)
+
+    def test_cached_parser_helper_evicts_oldest(self):
+        """_cached_parser should evict oldest entry when cache exceeds max size."""
+        from collections import OrderedDict
+        from tldr.cross_file_calls import _cached_parser, _parser_cache, MAX_PARSER_CACHE_SIZE
+
+        # Clear cache
+        _parser_cache.clear()
+
+        # Fill cache with dummy entries beyond the max
+        for i in range(MAX_PARSER_CACHE_SIZE + 2):
+            _parser_cache[f"dummy_lang_{i}"] = f"parser_{i}"
+
+        # Now use _cached_parser to add one more via a real factory
+        sentinel = object()
+        result = _cached_parser("test_lang", lambda: sentinel)
+
+        assert result is sentinel
+        assert "test_lang" in _parser_cache
+        assert len(_parser_cache) <= MAX_PARSER_CACHE_SIZE
+        # Oldest entries should have been evicted
+        assert "dummy_lang_0" not in _parser_cache
+
+        # Clean up
+        _parser_cache.clear()
+
+    def test_cached_parser_returns_existing(self):
+        """_cached_parser should return existing cached parser without re-creating."""
+        from tldr.cross_file_calls import _cached_parser, _parser_cache
+
+        _parser_cache.clear()
+
+        sentinel = object()
+        _parser_cache["existing_lang"] = sentinel
+
+        call_count = 0
+        def factory():
+            nonlocal call_count
+            call_count += 1
+            return object()
+
+        result = _cached_parser("existing_lang", factory)
+        assert result is sentinel
+        assert call_count == 0  # factory should NOT have been called
+
+        _parser_cache.clear()
+
+    def test_cached_parser_moves_to_end_on_access(self):
+        """Accessing a cached parser should move it to end (most recently used)."""
+        from tldr.cross_file_calls import _cached_parser, _parser_cache
+
+        _parser_cache.clear()
+
+        # Add entries in order
+        _parser_cache["lang_a"] = "parser_a"
+        _parser_cache["lang_b"] = "parser_b"
+        _parser_cache["lang_c"] = "parser_c"
+
+        # Access lang_a (should move to end)
+        _cached_parser("lang_a", lambda: None)
+
+        keys = list(_parser_cache.keys())
+        assert keys[-1] == "lang_a", f"lang_a should be last (MRU), got order: {keys}"
+
+        _parser_cache.clear()
+
+
 class TestLanguageCaching:
     """Test that Language objects are cached."""
 
@@ -109,7 +192,7 @@ class TestLanguageCaching:
         from tldr import cross_file_calls
 
         assert hasattr(cross_file_calls, "_parser_cache")
-        assert isinstance(cross_file_calls._parser_cache, dict)
+        assert isinstance(cross_file_calls._parser_cache, (dict,))
 
     def test_get_ts_parser_caches_parser(self):
         """_get_ts_parser should return cached parser on second call."""

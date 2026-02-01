@@ -238,6 +238,69 @@ class TestHandleNotifyIgnoreCheck:
         )
 
 
+class TestMemoryPressureHandler:
+    """Test the memory pressure handler in TLDRDaemon."""
+
+    def test_constant_exists(self):
+        """MEMORY_CLEANUP_THRESHOLD_GB constant should exist."""
+        from tldr.daemon.core import MEMORY_CLEANUP_THRESHOLD_GB
+
+        assert MEMORY_CLEANUP_THRESHOLD_GB == 3.0
+
+    def test_check_memory_pressure_method_exists(self):
+        """TLDRDaemon should have a _check_memory_pressure method."""
+        from tldr.daemon.core import TLDRDaemon
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = TLDRDaemon(Path(tmpdir))
+            assert hasattr(daemon, "_check_memory_pressure")
+            assert callable(daemon._check_memory_pressure)
+
+    def test_no_cleanup_below_threshold(self):
+        """When RSS is below threshold, no cleanup should happen."""
+        from tldr.daemon.core import TLDRDaemon
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = TLDRDaemon(Path(tmpdir))
+
+            with patch("tldr.daemon.core._get_rss_gb", return_value=1.0):
+                with patch("tldr.daemon.core.gc.collect") as mock_gc:
+                    daemon._check_memory_pressure()
+                    mock_gc.assert_not_called()
+
+    def test_cleanup_above_threshold(self):
+        """When RSS exceeds threshold, caches should be cleared and gc.collect called."""
+        from tldr.daemon.core import TLDRDaemon
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            daemon = TLDRDaemon(Path(tmpdir))
+
+            with patch("tldr.daemon.core._get_rss_gb", return_value=4.0):
+                with patch("tldr.daemon.core.gc.collect") as mock_gc:
+                    with patch(
+                        "tldr.daemon.core._scan_project_cached"
+                    ) as mock_scan:
+                        mock_scan.cache_clear = MagicMock()
+                        with patch(
+                            "tldr.daemon.core._parse_imports_cached"
+                        ) as mock_parse:
+                            mock_parse.cache_clear = MagicMock()
+                            daemon._check_memory_pressure()
+                            mock_scan.cache_clear.assert_called_once()
+                            mock_parse.cache_clear.assert_called_once()
+                            mock_gc.assert_called_once()
+
+    def test_check_memory_pressure_called_in_handle_notify(self):
+        """_check_memory_pressure should be called at the end of _handle_notify."""
+        from tldr.daemon.core import TLDRDaemon
+        import inspect
+
+        source = inspect.getsource(TLDRDaemon._handle_notify)
+        assert "_check_memory_pressure" in source, (
+            "_handle_notify should call _check_memory_pressure"
+        )
+
+
 class TestHashingMemoryEfficiency:
     """Verify the hashing implementation is memory-efficient."""
 

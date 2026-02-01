@@ -119,7 +119,7 @@ class SalsaDB:
     """
 
     # Default max cache size (can be overridden per-instance)
-    DEFAULT_MAX_CACHE_SIZE = 10000
+    DEFAULT_MAX_CACHE_SIZE = 1000
 
     def __init__(self, max_cache_size: int = DEFAULT_MAX_CACHE_SIZE):
         self._lock = threading.RLock()
