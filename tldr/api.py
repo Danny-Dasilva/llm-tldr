@@ -1500,7 +1500,8 @@ def search(
     else:
         # Parallel for large projects
         results = []
-        with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        import multiprocessing as _mp
+        with ProcessPoolExecutor(max_workers=_MAX_WORKERS, mp_context=_mp.get_context("spawn")) as executor:
             futures = {
                 executor.submit(_search_file, f, pattern, root, context_lines): f
                 for f in all_files
@@ -1690,7 +1691,8 @@ def get_code_structure(
         # Limit files to process based on max_results (with buffer for failures)
         files_to_process = all_files[:max_results * 2] if max_results > 0 else all_files
 
-        with ProcessPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        import multiprocessing as _mp
+        with ProcessPoolExecutor(max_workers=_MAX_WORKERS, mp_context=_mp.get_context("spawn")) as executor:
             futures = {
                 executor.submit(_extract_file_structure, f, root): f
                 for f in files_to_process

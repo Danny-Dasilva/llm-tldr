@@ -178,9 +178,22 @@ class TLDRDaemon:
         # Usage tracking for daemon commands
         self._tracker = UsageTracker()
 
-        # Memory profiling
-        tracemalloc.start()
-        _log_memory_snapshot("Daemon startup")
+        # Memory profiling - only enable when explicitly requested via env var
+        # tracemalloc doubles heap overhead and should never run in production
+        if os.environ.get("TLDR_PROFILE_MEMORY"):
+            tracemalloc.start(1)  # nframes=1 to limit overhead
+            logger.info("tracemalloc enabled (TLDR_PROFILE_MEMORY set)")
+
+        # Hard memory limit: prevent OOM by capping virtual memory
+        try:
+            import resource
+            HARD_MEMORY_LIMIT_GB = int(os.environ.get("TLDR_MEMORY_LIMIT_GB", "4"))
+            limit_bytes = HARD_MEMORY_LIMIT_GB * 1024 * 1024 * 1024
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))
+            logger.info(f"Set RLIMIT_AS to {HARD_MEMORY_LIMIT_GB}GB (was soft={soft}, hard={hard})")
+        except (ImportError, ValueError, OSError) as e:
+            logger.warning(f"Could not set memory limit: {e}")
 
         # Cross-platform graceful shutdown: register atexit handler
         # This ensures stats persist even if daemon is killed (works on all platforms)
@@ -203,6 +216,28 @@ class TLDRDaemon:
             )
             _scan_project_cached.cache_clear()
             _parse_imports_cached.cache_clear()
+
+            # Also clear SalsaDB caches (previously missed)
+            self.salsa_db.clear()
+
+            # Clear dedup index stale entries
+            if self.dedup_index:
+                self.dedup_index._by_hash.clear()
+                self.dedup_index._path_to_hash.clear()
+
+            # Clear cfg parser cache (native memory, invisible to GC)
+            from tldr.cfg_extractor import _cfg_parser_cache
+            _cfg_parser_cache.clear()
+
+            # Evict old session stats (keep last 50)
+            if len(self._session_stats) > 50:
+                sorted_sessions = sorted(
+                    self._session_stats.items(),
+                    key=lambda x: getattr(x[1], 'last_seen', 0),
+                )
+                for key, _ in sorted_sessions[:-50]:
+                    del self._session_stats[key]
+
             gc.collect()
             new_rss_gb = _get_rss_gb()
             logger.warning(
@@ -1040,14 +1075,19 @@ class TLDRDaemon:
         else:
             logger.info("Created new content-hash index")
 
-        # Index all Python files in project
-        for py_file in self.project.rglob("*.py"):
-            if ".venv" in str(py_file) or "__pycache__" in str(py_file):
-                continue
-            try:
-                self.dedup_index.get_or_create_edges(str(py_file), lang="python")
-            except Exception as e:
-                logger.debug(f"Could not index {py_file}: {e}")
+        # Index Python files in project, respecting .tldrignore
+        try:
+            from tldr.cross_file_calls import scan_project
+            py_files = scan_project(self.project, language="python")
+            for py_file in py_files:
+                try:
+                    self.dedup_index.get_or_create_edges(
+                        str(self.project / py_file), lang="python"
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not index {py_file}: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to scan project for dedup index: {e}")
 
     def _save_dedup_index(self):
         """Persist ContentHashedIndex to disk."""
@@ -1073,8 +1113,9 @@ class TLDRDaemon:
         Returns:
             Response with dirty count and reindex status
         """
-        # Memory profiling: before processing
-        _log_memory_snapshot("Before _handle_notify")
+        # Memory profiling: only when explicitly enabled
+        if os.environ.get("TLDR_PROFILE_MEMORY"):
+            _log_memory_snapshot("Before _handle_notify")
 
         file_path = command.get("file")
         if not file_path:
@@ -1121,14 +1162,14 @@ class TLDRDaemon:
         if should_reindex:
             self._trigger_background_reindex()
 
-        # Memory profiling: after processing
-        _log_memory_snapshot("After _handle_notify")
+        # Memory profiling: only when explicitly enabled
+        if os.environ.get("TLDR_PROFILE_MEMORY"):
+            _log_memory_snapshot("After _handle_notify")
 
         # Check if memory exceeds warning threshold
         rss_gb = _get_rss_gb()
         if rss_gb > MEMORY_WARNING_THRESHOLD_GB:
             logger.warning(f"Memory usage high: {rss_gb:.2f} GB (threshold: {MEMORY_WARNING_THRESHOLD_GB} GB)")
-            _log_memory_snapshot(f"Memory warning: {rss_gb:.2f} GB")
 
         # Reactive cleanup when memory exceeds cleanup threshold
         self._check_memory_pressure()

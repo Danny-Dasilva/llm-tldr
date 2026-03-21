@@ -347,12 +347,15 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
 
     # Process files in parallel for better performance
     files = structure.get("files", [])
-    max_workers = int(os.environ.get("TLDR_MAX_WORKERS", os.cpu_count() or 4))
+    max_workers = int(os.environ.get("TLDR_MAX_WORKERS", min(4, os.cpu_count() or 4)))
 
     # Use parallel processing if we have multiple files
+    # Use 'spawn' context to avoid fork-copying parent's entire address space
     if len(files) > 1 and max_workers > 1:
         try:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            import multiprocessing
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
                 futures = {
                     executor.submit(
                         _process_file_for_extraction,

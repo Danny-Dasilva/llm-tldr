@@ -11,6 +11,7 @@ Precedence (highest to lowest):
 
 from __future__ import annotations
 
+import os
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -393,6 +394,12 @@ def should_ignore(
         spec = load_ignore_patterns(project_dir)
 
     project_path = Path(project_dir)
+
+    # Preserve trailing slash for directory matching
+    # (Path() normalizes away trailing slashes, but patterns like .venv/ need them)
+    input_str = str(file_path)
+    had_trailing_slash = input_str.endswith('/') or input_str.endswith(os.sep)
+
     file_path = Path(file_path)
 
     # Make path relative to project for matching
@@ -403,6 +410,8 @@ def should_ignore(
         rel_path = file_path
 
     rel_path_str = str(rel_path)
+    if had_trailing_slash and not rel_path_str.endswith('/'):
+        rel_path_str += '/'
 
     # .tldrignore is the final authority - it can:
     # - Add ignores (positive patterns)

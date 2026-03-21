@@ -1219,6 +1219,8 @@ class TreeSitterCFGBuilder:
 
 
 # Module-level parser cache for performance (parsers are expensive to create)
+# Capped at 5 entries to limit native memory usage (~10-50MB per parser)
+_CFG_PARSER_CACHE_MAX = 5
 _cfg_parser_cache: dict[str, object] = {}
 
 
@@ -1230,6 +1232,11 @@ def _get_ts_parser(language: str):
     # Check cache first
     if language in _cfg_parser_cache:
         return _cfg_parser_cache[language]
+
+    # Evict oldest if at capacity
+    if len(_cfg_parser_cache) >= _CFG_PARSER_CACHE_MAX:
+        oldest_key = next(iter(_cfg_parser_cache))
+        del _cfg_parser_cache[oldest_key]
 
     from tree_sitter import Language, Parser
 

@@ -124,16 +124,18 @@ class SalsaDB:
     def __init__(self, max_cache_size: int = DEFAULT_MAX_CACHE_SIZE):
         self._lock = threading.RLock()
 
-        # File storage
+        # File storage - bounded to prevent unbounded growth
+        self._max_file_entries = max_cache_size * 2  # 2x query cache size
         self._file_contents: Dict[str, str] = {}
         self._file_revisions: Dict[str, int] = {}
 
         # Query cache: (func, args) -> CacheEntry
         self._query_cache: Dict[QueryKey, CacheEntry] = {}
 
-        # LRU tracking: ordered list of keys from oldest to newest access
+        # LRU tracking: use OrderedDict for O(1) move-to-end instead of O(n) list.remove
         self._max_cache_size = max_cache_size
-        self._lru_order: List[QueryKey] = []
+        from collections import OrderedDict
+        self._lru_order_dict: OrderedDict = OrderedDict()
 
         # Reverse dependencies: query_key -> set of dependent query_keys
         self._reverse_deps: Dict[QueryKey, Set[QueryKey]] = {}
@@ -148,18 +150,15 @@ class SalsaDB:
         self._query_stack: List[QueryKey] = []
 
     def _touch_lru(self, key: QueryKey) -> None:
-        """Move a key to the end of the LRU list (most recently used)."""
-        # Remove if exists
-        if key in self._lru_order:
-            self._lru_order.remove(key)
-        # Add to end (most recently used)
-        self._lru_order.append(key)
+        """Move a key to the end of the LRU dict (most recently used). O(1)."""
+        self._lru_order_dict[key] = None
+        self._lru_order_dict.move_to_end(key)
 
     def _evict_lru_if_needed(self) -> None:
         """Evict oldest entries if cache exceeds max size."""
-        while len(self._query_cache) > self._max_cache_size and self._lru_order:
-            # Get oldest key
-            oldest_key = self._lru_order.pop(0)
+        while len(self._query_cache) > self._max_cache_size and self._lru_order_dict:
+            # Pop oldest key - O(1)
+            oldest_key, _ = self._lru_order_dict.popitem(last=False)
             if oldest_key in self._query_cache:
                 # Clean up all related tracking
                 self._remove_cache_entry(oldest_key)
@@ -169,6 +168,9 @@ class SalsaDB:
         if key in self._query_cache:
             del self._query_cache[key]
             self._stats.invalidations += 1
+
+        # Clean up LRU tracking
+        self._lru_order_dict.pop(key, None)
 
         # Clean up reverse deps
         if key in self._reverse_deps:
@@ -196,6 +198,15 @@ class SalsaDB:
             old_revision = self._file_revisions.get(path, 0)
             self._file_contents[path] = content
             self._file_revisions[path] = old_revision + 1
+
+            # Evict oldest file entries if exceeding max
+            while len(self._file_contents) > self._max_file_entries:
+                oldest_path = next(iter(self._file_contents))
+                if oldest_path != path:  # Don't evict what we just set
+                    del self._file_contents[oldest_path]
+                    self._file_revisions.pop(oldest_path, None)
+                else:
+                    break
 
             # Invalidate queries that depend on this file
             self._invalidate_file_dependents(path)
@@ -487,6 +498,9 @@ class SalsaDB:
             self._query_cache.clear()
             self._reverse_deps.clear()
             self._file_to_queries.clear()
-            # Keep file contents and revisions
+            self._lru_order_dict.clear()
+            # Also clear file contents to free memory
+            self._file_contents.clear()
+            self._file_revisions.clear()
             # Reset stats
             self._stats = QueryStats()
