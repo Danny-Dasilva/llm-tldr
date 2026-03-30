@@ -442,6 +442,9 @@ class HybridExtractor:
             else:
                 parser.language = Language(tree_sitter_javascript.language())
             self._ts_parsers[language] = parser
+            if len(self._ts_parsers) > 5:
+                oldest = next(iter(self._ts_parsers))
+                del self._ts_parsers[oldest]
         return self._ts_parsers[language]
 
     def _safe_parse(self, parser: Any, source: bytes, file_path: Path, language: str) -> Any:

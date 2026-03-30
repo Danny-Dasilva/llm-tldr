@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # Memory profiling
 MEMORY_LOG_PATH = "/tmp/tldr-memory-profile.log"
 MEMORY_WARNING_THRESHOLD_GB = 5.0
-MEMORY_CLEANUP_THRESHOLD_GB = 3.0
+MEMORY_CLEANUP_THRESHOLD_GB = 1.0
 
 
 def _log_memory_snapshot(label: str, log_path: str = MEMORY_LOG_PATH):
@@ -238,12 +238,28 @@ class TLDRDaemon:
                 for key, _ in sorted_sessions[:-50]:
                     del self._session_stats[key]
 
+            # Free semantic model if loaded
+            try:
+                import tldr.semantic as sem
+                if sem._model is not None:
+                    sem._model = None
+                    sem._model_name = None
+                    logger.info("Cleared semantic model from memory")
+            except Exception:
+                pass
+
             gc.collect()
             new_rss_gb = _get_rss_gb()
             logger.warning(
                 f"Memory after cleanup: {new_rss_gb:.2f} GB "
                 f"(freed {rss_gb - new_rss_gb:.2f} GB)"
             )
+
+            # Hard limit: restart if cleanup wasn't enough
+            rss_after = _get_rss_gb()
+            if rss_after > 1.5:
+                logger.warning(f"RSS still {rss_after:.1f}GB after cleanup, requesting restart")
+                self._shutdown_requested = True
 
     def _load_semantic_config(self) -> dict:
         """Load semantic search configuration.
@@ -1729,6 +1745,13 @@ class TLDRDaemon:
 
     def run(self):
         """Run the daemon main loop."""
+        # Set up process group so all children can be killed together
+        if sys.platform != "win32":
+            try:
+                os.setpgrp()
+            except OSError:
+                pass
+
         self.write_pid_file()
         self.write_status("indexing")
 
@@ -1745,6 +1768,8 @@ class TLDRDaemon:
         # SIGTERM only on Unix/Mac (Windows ignores it but doesn't raise)
         if sys.platform != "win32":
             signal.signal(signal.SIGTERM, _signal_handler)
+            # Reap zombie children automatically
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
         try:
             self._create_socket()
@@ -1754,6 +1779,9 @@ class TLDRDaemon:
 
             while not self._shutdown_requested:
                 self._handle_one_connection()
+
+                # Check memory pressure periodically
+                self._check_memory_pressure()
 
                 # Check for idle timeout
                 if self.is_idle():
@@ -1775,4 +1803,12 @@ class TLDRDaemon:
             self._cleanup_socket()
             self.remove_pid_file()
             self.write_status("stopped")
+
+            # Kill entire process group (all children) on exit
+            if sys.platform != "win32":
+                try:
+                    os.killpg(os.getpgrp(), signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+
             logger.info("Daemon stopped")

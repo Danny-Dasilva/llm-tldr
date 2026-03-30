@@ -550,6 +550,9 @@ class IncrementalParser:
             if parser is None:
                 raise ValueError(f"Unsupported language: {language}")
             self._parsers[language] = parser
+            if len(self._parsers) > 5:
+                oldest = next(iter(self._parsers))
+                del self._parsers[oldest]
         return self._parsers[language]
 
     def parse(self, file_path: str, language: str) -> Any:

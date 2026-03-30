@@ -119,7 +119,7 @@ class SalsaDB:
     """
 
     # Default max cache size (can be overridden per-instance)
-    DEFAULT_MAX_CACHE_SIZE = 1000
+    DEFAULT_MAX_CACHE_SIZE = 50
 
     def __init__(self, max_cache_size: int = DEFAULT_MAX_CACHE_SIZE):
         self._lock = threading.RLock()
@@ -179,6 +179,10 @@ class SalsaDB:
         # Clean up file_to_queries references
         for file_path in list(self._file_to_queries.keys()):
             self._file_to_queries[file_path].discard(key)
+
+        # Clean stale key from all reverse_deps value sets
+        for deps_set in list(self._reverse_deps.values()):
+            deps_set.discard(key)
 
     # -------------------------------------------------------------------------
     # File Management
