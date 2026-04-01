@@ -8,7 +8,7 @@
 
 ```bash
 # One-liner: Install, index, search
-pip install llm-tldr && tldr warm . && tldr semantic "what you're looking for" .
+pip install git+https://github.com/Danny-Dasilva/llm-tldr.git && tldr warm . && tldr semantic "what you're looking for" .
 ```
 
 Your codebase is 100K lines. Claude's context window is 200K tokens. Raw code won't fit—and even if it did, the LLM would drown in irrelevant details.
@@ -16,7 +16,7 @@ Your codebase is 100K lines. Claude's context window is 200K tokens. Raw code wo
 TLDR extracts *structure* instead of dumping *text*. The result: **95% fewer tokens** while preserving everything needed to understand and edit code correctly.
 
 ```bash
-pip install llm-tldr
+pip install git+https://github.com/Danny-Dasilva/llm-tldr.git
 tldr warm .                    # Index your project
 tldr context main --project .  # Get LLM-ready summary
 ```
@@ -105,7 +105,7 @@ tldr warm /path/to/project
 tldr semantic "database connection pooling" .
 ```
 
-Embedding dependencies (`sentence-transformers`, `faiss-cpu`) are included with `pip install llm-tldr`. The index is cached in `.tldr/cache/semantic.faiss`.
+Embedding dependencies (`sentence-transformers`, `faiss-cpu`) are included with the install. The index is cached in `.tldr/cache/semantic.faiss`.
 
 ### Keeping the Index Fresh
 
@@ -175,7 +175,7 @@ tldr semantic "validate JWT tokens" .   # Natural language search
 ### 1. Install
 
 ```bash
-pip install llm-tldr
+pip install git+https://github.com/Danny-Dasilva/llm-tldr.git
 ```
 
 ### 2. Index Your Project
