@@ -26,6 +26,13 @@ from typing import Optional
 _PARALLEL_THRESHOLD = int(os.environ.get('TLDR_PARALLEL_THRESHOLD', '100'))
 _MAX_WORKERS = int(os.environ.get('TLDR_MAX_WORKERS', '4'))
 
+# Per-file byte cap for search. Files larger than this are skipped to prevent
+# workers from ballooning on generated artifacts (lockfiles, bundles, SQL dumps).
+_SEARCH_MAX_BYTES = int(os.environ.get('TLDR_SEARCH_MAX_BYTES', str(10 * 1024 * 1024)))
+# Upper bound on pending futures in the search pool — avoids queuing 10k+ tasks
+# at once, which keeps Path objects and intermediate state bounded.
+_SEARCH_BATCH_SIZE = int(os.environ.get('TLDR_SEARCH_BATCH_SIZE', '256'))
+
 from .ast_extractor import (
     CallGraphInfo,  # Re-exported for API consumers
     ClassInfo,  # Re-exported for API consumers
@@ -1401,6 +1408,11 @@ def _search_file(
 
     Helper function for parallel search. Must be top-level for pickling.
 
+    Memory-safe: skips files larger than ``_SEARCH_MAX_BYTES`` and streams
+    line-by-line instead of loading the whole file. Previously this function
+    called ``read_text()`` + ``splitlines()``, which could push a worker's RSS
+    to multiple GB on large generated files (lockfiles, bundled JS, SQL dumps).
+
     Args:
         file_path: Path to file to search
         pattern: Regex pattern string
@@ -1411,29 +1423,53 @@ def _search_file(
         List of match dicts for this file
     """
     import re
+    from collections import deque
 
-    results = []
-    compiled = re.compile(pattern)
+    results: list[dict] = []
 
     try:
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-        lines = content.splitlines()
+        size = file_path.stat().st_size
+    except OSError:
+        return results
+    if size > _SEARCH_MAX_BYTES:
+        return results
 
-        for i, line in enumerate(lines, 1):
-            if compiled.search(line):
-                match = {
-                    "file": str(file_path.relative_to(root)),
-                    "line": i,
-                    "content": line.strip(),
-                }
+    compiled = re.compile(pattern)
+    rel = str(file_path.relative_to(root))
 
-                # Add context if requested
-                if context_lines > 0:
-                    start = max(0, i - 1 - context_lines)
-                    end = min(len(lines), i + context_lines)
-                    match["context"] = lines[start:end]
+    try:
+        # Bounded sliding window for trailing context; None when not needed.
+        before: deque[str] | None = deque(maxlen=context_lines) if context_lines > 0 else None
+        # Matches awaiting trailing context lines: (match_dict, lines_remaining).
+        pending: list[tuple[dict, int]] = []
 
-                results.append(match)
+        with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for i, raw in enumerate(fh, 1):
+                line = raw.rstrip("\n").rstrip("\r")
+
+                # Fill trailing context for earlier matches.
+                if pending:
+                    still: list[tuple[dict, int]] = []
+                    for match, remaining in pending:
+                        match["context"].append(line)
+                        if remaining > 1:
+                            still.append((match, remaining - 1))
+                    pending = still
+
+                if compiled.search(line):
+                    match: dict = {
+                        "file": rel,
+                        "line": i,
+                        "content": line.strip(),
+                    }
+                    if context_lines > 0:
+                        match["context"] = list(before) if before else []
+                        match["context"].append(line)
+                        pending.append((match, context_lines))
+                    results.append(match)
+
+                if before is not None:
+                    before.append(line)
     except (OSError, UnicodeDecodeError):
         pass
 
@@ -1498,27 +1534,29 @@ def search(
                 return results[:max_results]
         return results
     else:
-        # Parallel for large projects
-        results = []
+        # Parallel for large projects — submit in bounded batches so we don't
+        # queue tens of thousands of futures at once, and can actually honor
+        # max_results early instead of waiting for already-dispatched tasks.
+        results: list[dict] = []
         import multiprocessing as _mp
         with ProcessPoolExecutor(max_workers=_MAX_WORKERS, mp_context=_mp.get_context("spawn")) as executor:
-            futures = {
-                executor.submit(_search_file, f, pattern, root, context_lines): f
-                for f in all_files
-            }
-            for future in as_completed(futures):
-                try:
-                    file_results = future.result()
-                    results.extend(file_results)
-                    # Check result limit (approximate - may slightly exceed)
-                    if max_results > 0 and len(results) >= max_results:
-                        # Cancel remaining futures
-                        for f in futures:
-                            f.cancel()
-                        return results[:max_results]
-                except Exception:
-                    # Skip files that fail
-                    pass
+            for batch_start in range(0, len(all_files), _SEARCH_BATCH_SIZE):
+                batch = all_files[batch_start:batch_start + _SEARCH_BATCH_SIZE]
+                futures = [
+                    executor.submit(_search_file, f, pattern, root, context_lines)
+                    for f in batch
+                ]
+                for future in as_completed(futures):
+                    try:
+                        file_results = future.result()
+                        results.extend(file_results)
+                        if max_results > 0 and len(results) >= max_results:
+                            for f in futures:
+                                f.cancel()
+                            return results[:max_results]
+                    except Exception:
+                        # Skip files that fail
+                        pass
         return results[:max_results] if max_results > 0 else results
 
 
